@@ -19,7 +19,9 @@ class BareBaseModel(Base):
     __abstract__ = True
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    created_at = Column(Float, default=datetime.now().timestamp)
+    created_at = Column(Float, default=lambda: datetime.now().timestamp())
     updated_at = Column(
-        Float, default=datetime.now().timestamp, onupdate=datetime.now().timestamp
+        Float,
+        default=lambda: datetime.now().timestamp(),
+        onupdate=lambda: datetime.now().timestamp(),
     )

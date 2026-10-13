@@ -101,3 +101,7 @@ watchfiles==1.0.5
 websockets==15.0.1
 wheel==0.43.0
 zipp==3.21.0
+docker==7.1.0
+openai==2.46.0
+paddleocr==3.0.0
+paddlepaddle==3.0.0
