@@ -47,6 +47,15 @@ services:
       - *common-volumes
     ports:
       - 8000:8000
+    # DockerRunner needs the daemon socket to create one isolated container
+    # per submission. Keep this on the trusted application service only.
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+      - ./requirements.txt:/app/requirements.txt
+      - ./.env:/app/.env
+      - ./entrypoint.sh:/app/entrypoint.sh
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["/app/entrypoint.sh"]
     depends_on:
       db:

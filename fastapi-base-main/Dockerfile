@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 
 RUN apt update 
 RUN apt upgrade -y 
-RUN apt install -y nano unixodbc unixodbc-dev
+RUN apt install -y nano unixodbc unixodbc-dev docker.io
 
 WORKDIR /app
 
