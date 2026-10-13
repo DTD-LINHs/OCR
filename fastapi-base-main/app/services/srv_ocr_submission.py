@@ -127,6 +127,9 @@ class DbRecorder:
         submission.syntax_ok = result.syntax_ok
         submission.syntax_errors = [e.model_dump() for e in result.syntax_errors]
         submission.uncertain_lines = result.uncertain_lines
+        submission.llm_used = result.llm_used
+        submission.corrections = [c.model_dump() for c in result.corrections]
+        submission.review_items = [item.model_dump() for item in result.review_items]
         submission.confidence = result.confidence
         submission.need_review = result.need_review
         submission.review_reasons = result.review_reasons

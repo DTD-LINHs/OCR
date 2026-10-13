@@ -18,6 +18,9 @@ class OcrSubmissionResponse(BaseModel):
     need_review: bool
     review_reasons: Optional[list[str]] = None
     uncertain_lines: Optional[list[int]] = None
+    llm_used: Optional[bool] = None
+    corrections: Optional[list[dict[str, Any]]] = None
+    review_items: Optional[list[dict[str, Any]]] = None
     confidence: Optional[float] = None
     timings: Optional[dict[str, Any]] = None
     error: Optional[str] = None

@@ -32,6 +32,9 @@ def build_layout(
     char_width = _estimate_char_width(items, median_height)
     rows = _group_rows(items)
     levels = _indent_levels([row[0].x_min for row in rows], char_width)
+    # The first line of a program is never indented. Shifting to it keeps a stray box
+    # further left (a margin note, a smudge) from pushing the whole program one level in.
+    levels = [max(level - levels[0], 0) for level in levels]
 
     lines: list[CodeLine] = []
     prev_bottom = None

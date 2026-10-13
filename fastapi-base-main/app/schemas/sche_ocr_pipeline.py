@@ -1,6 +1,6 @@
 """Data passed between the OCR pipeline stages (Paddle -> service -> LLM -> sandbox)."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel
 
@@ -57,13 +57,22 @@ class Correction(BaseModel):
     old: str = ""
     new: str = ""
     reason: str = ""
+    by: str = ""  # "normalize" or "llm"
+
+
+class ReviewItem(BaseModel):
+    """One place a teacher should compare with the photo."""
+
+    line: Optional[int] = None
+    reason: str
+    source: Literal["ocr", "llm", "sandbox"]
 
 
 class LlmTranscription(BaseModel):
     language: str = "unknown"
     code: str
     corrections: list[Correction] = []
-    uncertain_lines: list[int] = []
+    uncertain: list[ReviewItem] = []
     needs_review: bool = False
     review_reasons: list[str] = []
 
@@ -102,6 +111,11 @@ class PipelineResult(BaseModel):
     code: str
     syntax_ok: Optional[bool] = None
     syntax_errors: list[SyntaxIssue] = []
+    llm_used: bool = False
+    # Every change made to the OCR text, in order (normalize first, then the LLM)
+    corrections: list[Correction] = []
+    # Every place the teacher should check, with the reason
+    review_items: list[ReviewItem] = []
     uncertain_lines: list[int] = []
     confidence: Optional[float] = None
     need_review: bool

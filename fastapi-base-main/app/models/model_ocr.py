@@ -28,6 +28,10 @@ class OcrSubmission(BareBaseModel):
     need_review = Column(Boolean, nullable=False, default=False, index=True)
     review_reasons = Column(JSONB)
     uncertain_lines = Column(JSONB)
+    # Final output besides the code: what was changed, and what the teacher must check
+    llm_used = Column(Boolean)
+    corrections = Column(JSONB)
+    review_items = Column(JSONB)
     confidence = Column(Float)
     raw_ocr = Column(JSONB)
     timings = Column(JSONB)

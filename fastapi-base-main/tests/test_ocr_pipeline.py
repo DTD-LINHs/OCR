@@ -3,9 +3,11 @@ from typing import Optional
 import pytest
 
 from app.schemas.sche_ocr_pipeline import (
+    Correction,
     LlmCallRecord,
     LlmTranscription,
     OcrBox,
+    ReviewItem,
     SandboxResult,
     SyntaxIssue,
 )
@@ -19,9 +21,11 @@ def box(text, row, col=0, conf=0.95):
     return OcrBox(text=text, polygon=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]], confidence=conf)
 
 
-DRAFT_BOXES = [box("def f(x):", 0), box("return x", 1, col=4)]
 GOOD = "def f(x):\n    return x"
 BROKEN = "def f(x);\n    return x"
+GOOD_BOXES = [box("def f(x):", 0), box("return x", 1, col=4)]
+BROKEN_BOXES = [box("def f(x);", 0), box("return x", 1, col=4)]
+FIX = Correction(line=1, old="def f(x);", new="def f(x):", reason="';' đọc nhầm từ ':'")
 
 
 class FakeOcr:
@@ -33,10 +37,12 @@ class FakeOcr:
 
 
 class FakeLlm:
-    def __init__(self, transcription):
+    def __init__(self, transcription=None):
         self.transcription = transcription
+        self.calls = []
 
-    def transcribe(self, image_jpeg, draft, log):
+    def transcribe(self, image_jpeg, draft, syntax_errors, log):
+        self.calls.append((draft.render(), syntax_errors))
         log(LlmCallRecord(purpose="TRANSCRIBE", model="fake", prompt=draft.render(), parse_ok=True))
         return self.transcription
 
@@ -62,7 +68,7 @@ class FakeSandbox:
             command="check",
             exit_code=0 if ok else 1,
             ok=ok,
-            errors=[] if ok else [SyntaxIssue(line=1, message="SyntaxError: invalid syntax")],
+            errors=[] if ok else [SyntaxIssue(line=1, message="invalid syntax")],
         )
 
 
@@ -80,7 +86,7 @@ class MemoryRecorder:
         self.raw = boxes
 
     def on_code_version(self, stage, code, corrections, language=None, fix_round=0) -> Optional[int]:
-        self.versions.append((stage, code, fix_round))
+        self.versions.append((stage, code))
         return len(self.versions)
 
     def on_sandbox_check(self, version_id, result):
@@ -90,93 +96,123 @@ class MemoryRecorder:
         self.llm_calls.append(record)
 
 
-def make_pipeline(llm, sandbox=None, boxes=DRAFT_BOXES):
+def make_pipeline(llm=None, sandbox=None, boxes=GOOD_BOXES, language="python"):
     return OcrPipeline(
         ocr=FakeOcr(boxes),
-        llm=llm,
+        llm=llm or FakeLlm(),
         sandbox=sandbox or FakeSandbox(),
+        language=language,
         llm_image_fn=lambda image: image,
     )
 
 
-def transcription(code, language="python", review_reasons=(), uncertain=()):
+def fixed(code=GOOD, corrections=(FIX,), uncertain=(), review_reasons=()):
     return LlmTranscription(
-        language=language,
+        language="python",
         code=code,
+        corrections=list(corrections),
+        uncertain=list(uncertain),
         needs_review=bool(review_reasons),
         review_reasons=list(review_reasons),
-        uncertain_lines=list(uncertain),
     )
 
 
-def test_clean_transcription_is_done_without_review():
-    recorder = MemoryRecorder()
-    result = make_pipeline(FakeLlm(transcription(GOOD))).run(b"img", recorder)
+def test_code_that_compiles_skips_the_llm():
+    llm, recorder = FakeLlm(), MemoryRecorder()
+    result = make_pipeline(llm).run(b"img", recorder)
 
-    assert result.syntax_ok is True
+    assert llm.calls == []
+    assert result.llm_used is False
+    assert result.code == GOOD and result.syntax_ok is True
     assert result.need_review is False
-    assert result.code == GOOD
-    assert [v[0] for v in recorder.versions] == [
-        CodeStage.OCR_RAW,
-        CodeStage.SERVICE_NORMALIZED,
-        CodeStage.LLM_CORRECTED,
+    assert [v[0] for v in recorder.versions] == [CodeStage.OCR_RAW, CodeStage.SERVICE_NORMALIZED]
+    # The check is linked to the SERVICE_NORMALIZED version.
+    assert [c[0] for c in recorder.checks] == [2]
+    assert recorder.statuses == [OcrStatus.OCR_RUNNING, OcrStatus.SANDBOX_CHECKING]
+
+
+def test_syntax_error_is_fixed_by_llm_and_rechecked():
+    llm, recorder = FakeLlm(fixed()), MemoryRecorder()
+    result = make_pipeline(llm, boxes=BROKEN_BOXES).run(b"img", recorder)
+
+    # The LLM gets the OCR text and the sandbox errors
+    assert llm.calls == [(BROKEN, [SyntaxIssue(line=1, message="invalid syntax")])]
+    assert result.llm_used is True
+    assert result.code == GOOD and result.syntax_ok is True
+    assert [c[0] for c in recorder.checks] == [2, 3]
+    assert recorder.versions[-1] == (CodeStage.LLM_CORRECTED, GOOD)
+    assert recorder.statuses == [
+        OcrStatus.OCR_RUNNING, OcrStatus.SANDBOX_CHECKING, OcrStatus.LLM_CORRECTING, OcrStatus.SANDBOX_CHECKING,
     ]
-    assert recorder.statuses[0] == OcrStatus.OCR_RUNNING
-    assert len(recorder.checks) == 1
+    assert [(c.line, c.old, c.new, c.by) for c in result.corrections] == [(1, "def f(x);", "def f(x):", "llm")]
+    assert result.need_review is False
 
 
-def test_remaining_syntax_error_is_kept_and_flagged_for_review():
-    recorder = MemoryRecorder()
-    result = make_pipeline(FakeLlm(transcription(BROKEN))).run(b"img", recorder)
+def test_error_left_by_llm_is_reported_once_without_retry():
+    llm = FakeLlm(fixed(code=BROKEN, corrections=[]))
+    result = make_pipeline(llm, boxes=BROKEN_BOXES).run(b"img", MemoryRecorder())
 
-    assert result.code == BROKEN
-    assert result.syntax_ok is False
-    assert result.need_review is True
+    assert len(llm.calls) == 1
+    assert result.code == BROKEN and result.syntax_ok is False
     assert "syntax_errors" in result.review_reasons
-    # The check is linked to the LLM_CORRECTED version.
-    assert [c[0] for c in recorder.checks] == [3]
-    assert [c.purpose for c in recorder.llm_calls] == ["TRANSCRIBE"]
+    assert [(i.line, i.source) for i in result.review_items] == [(1, "sandbox")]
+    assert "invalid syntax" in result.review_items[0].reason
 
 
-def test_uncertain_lines_are_reported():
-    result = make_pipeline(FakeLlm(transcription(GOOD, uncertain=[2]))).run(b"img", MemoryRecorder())
+def test_normalize_fixes_are_listed():
+    boxes = [box("def f(x):", 0), box("return  x", 1, col=4)]  # double space is normalized
+    result = make_pipeline(boxes=boxes).run(b"img", MemoryRecorder())
+    assert [(c.line, c.new, c.by) for c in result.corrections] == [(2, "return x", "normalize")]
+
+
+def test_low_confidence_ocr_lines_are_listed_when_llm_is_skipped():
+    boxes = [box("def f(x):", 0), box("return x", 1, col=4, conf=0.5)]
+    result = make_pipeline(boxes=boxes).run(b"img", MemoryRecorder())
+
+    assert result.llm_used is False
+    assert [(i.line, i.source) for i in result.review_items] == [(2, "ocr")]
     assert result.uncertain_lines == [2]
     assert "uncertain_lines" in result.review_reasons
 
 
-def test_unsupported_language_skips_sandbox():
-    sandbox = FakeSandbox()
-    result = make_pipeline(FakeLlm(transcription(GOOD, language="Kotlin")), sandbox=sandbox).run(
-        b"img", MemoryRecorder()
-    )
-    assert result.language == "kotlin"
+def test_llm_uncertain_spots_and_reasons_are_listed():
+    unsure = ReviewItem(line=2, reason="LLM không chắc 'x': có thể là '×'", source="llm")
+    llm = FakeLlm(fixed(uncertain=[unsure], review_reasons=["Có 1 chỗ LLM không chắc"]))
+    result = make_pipeline(llm, boxes=BROKEN_BOXES).run(b"img", MemoryRecorder())
+
+    assert result.review_items == [unsure]
+    assert result.uncertain_lines == [2]
+    assert {"uncertain_lines", "llm: Có 1 chỗ LLM không chắc"} <= set(result.review_reasons)
+
+
+def test_llm_rewrite_is_flagged():
+    rewritten = "import os\nclass Totally:\n    pass\n" * 3
+    llm = FakeLlm(fixed(code=rewritten, corrections=[]))
+    result = make_pipeline(llm, boxes=BROKEN_BOXES).run(b"img", MemoryRecorder())
+    assert "large_llm_changes" in result.review_reasons
+
+
+def test_low_mean_ocr_confidence_is_flagged():
+    boxes = [box("def f(x):", 0, conf=0.6), box("return x", 1, col=4, conf=0.7)]
+    result = make_pipeline(boxes=boxes).run(b"img", MemoryRecorder())
+    assert result.confidence == pytest.approx(0.65)
+    assert "low_confidence" in result.review_reasons
+
+
+def test_unsupported_language_skips_sandbox_and_llm():
+    llm, sandbox = FakeLlm(), FakeSandbox()
+    result = make_pipeline(llm, sandbox=sandbox, language="kotlin").run(b"img", MemoryRecorder())
     assert result.syntax_ok is None
-    assert sandbox.checked == []
+    assert sandbox.checked == [] and llm.calls == []
     assert result.review_reasons == ["language_not_checked"]
 
 
 def test_sandbox_down_does_not_fail_the_job():
-    result = make_pipeline(FakeLlm(transcription(GOOD)), sandbox=FakeSandbox(available=False)).run(
-        b"img", MemoryRecorder()
-    )
+    result = make_pipeline(sandbox=FakeSandbox(available=False)).run(b"img", MemoryRecorder())
     assert result.syntax_ok is None
     assert "sandbox_unavailable" in result.review_reasons
 
 
-def test_llm_reasons_and_rewrite_are_flagged():
-    rewritten = "import os\nclass Totally:\n    pass\n" * 3
-    llm = FakeLlm(transcription(rewritten, language="unknown", review_reasons=["LLM có thể đã viết lại code"]))
-    result = make_pipeline(llm).run(b"img", MemoryRecorder())
-    assert {"large_llm_changes", "llm: LLM có thể đã viết lại code"} <= set(result.review_reasons)
-
-
-def test_low_ocr_confidence_is_flagged():
-    boxes = [box("def f(x):", 0, conf=0.6), box("return x", 1, col=4, conf=0.7)]
-    result = make_pipeline(FakeLlm(transcription(GOOD)), boxes=boxes).run(b"img", MemoryRecorder())
-    assert result.confidence == pytest.approx(0.65)
-    assert result.review_reasons == ["low_confidence"]
-
-
 def test_no_text_raises():
     with pytest.raises(PipelineError):
-        make_pipeline(FakeLlm(transcription(GOOD)), boxes=[]).run(b"img", MemoryRecorder())
+        make_pipeline(boxes=[]).run(b"img", MemoryRecorder())

@@ -2,7 +2,7 @@ import base64
 
 import pytest
 
-from app.schemas.sche_ocr_pipeline import CodeLine, LayoutResult
+from app.schemas.sche_ocr_pipeline import CodeLine, LayoutResult, SyntaxIssue
 from app.services.srv_ocr_adapters import LlmServiceAdapter, PrecheckSandbox
 from app.utils.exception_handler import CustomException
 
@@ -39,7 +39,7 @@ def test_llm_adapter_maps_mock_correction():
     # conftest sets LLM_PROVIDER=mock: the real LLMService runs without calling any LLM.
     calls = []
     draft = layout((0, "DEF f(x):"), (1, "RETURN x"))
-    result = LlmServiceAdapter().transcribe(b"jpeg", draft, log=calls.append)
+    result = LlmServiceAdapter().transcribe(b"jpeg", draft, [], log=calls.append)
 
     assert result.language == "python"
     assert result.code == "def f(x):\n    return x"
@@ -55,18 +55,19 @@ def test_llm_adapter_sends_rendered_lines_scores_and_image():
 
     service = FakeService(
         CorrectOcrResponse(
-            code="x = 1", uncertain=[UncertainSpot(line=1, text="x", note="?")], syntax_ok=True,
+            code="x = 1", uncertain=[UncertainSpot(line=1, text="x", note="có thể là ×")], syntax_ok=True,
             similarity=1.0, needs_review=True, review_reasons=["Có 1 chỗ LLM không chắc"], model="fake-model",
         )
     )
     draft = layout((0, "if x:"), (1, "y = l"), low=(2,))
-    result = LlmServiceAdapter(service).transcribe(b"jpeg", draft, log=lambda r: None)
+    errors = [SyntaxIssue(line=2, message="invalid syntax"), SyntaxIssue(message="unexpected EOF")]
+    result = LlmServiceAdapter(service).transcribe(b"jpeg", draft, errors, log=lambda r: None)
 
     request = service.requests[0]
     assert request.ocr_text == "if x:\n    y = l"
     assert [(line.text, line.score) for line in request.lines] == [("if x:", 0.99), ("    y = l", 0.5)]
     assert base64.b64decode(request.image_base64) == b"jpeg"
-    assert result.uncertain_lines == [1]
+    assert [(u.line, u.source, u.reason) for u in result.uncertain] == [(1, "llm", "LLM không chắc 'x': có thể là ×")]
     assert result.needs_review is True
     assert result.review_reasons == ["Có 1 chỗ LLM không chắc"]
 
@@ -75,7 +76,7 @@ def test_llm_adapter_logs_failed_call_and_reraises():
     calls = []
     service = FakeService(error=CustomException(http_code=502, message="LLM không trả về JSON hợp lệ"))
     with pytest.raises(CustomException):
-        LlmServiceAdapter(service).transcribe(b"jpeg", layout((0, "x = 1")), log=calls.append)
+        LlmServiceAdapter(service).transcribe(b"jpeg", layout((0, "x = 1")), [], log=calls.append)
 
     assert calls[0].parse_ok is False
     assert calls[0].error == "LLM không trả về JSON hợp lệ"

@@ -19,6 +19,7 @@ from app.schemas.sche_ocr_pipeline import (
     LayoutResult,
     LlmCallRecord,
     LlmTranscription,
+    ReviewItem,
     SandboxResult,
     SyntaxIssue,
 )
@@ -40,7 +41,10 @@ class LlmServiceAdapter:
     def __init__(self, service: Optional[LLMService] = None):
         self.service = service or LLMService()
 
-    def transcribe(self, image_jpeg: bytes, draft: LayoutResult, log) -> LlmTranscription:
+    def transcribe(
+        self, image_jpeg: bytes, draft: LayoutResult, syntax_errors: list[SyntaxIssue], log
+    ) -> LlmTranscription:
+        # correct_ocr has no field for the sandbox errors yet, so `syntax_errors` is not sent.
         ocr_text = draft.render()
         request = CorrectOcrRequest(
             ocr_text=ocr_text,
@@ -72,7 +76,10 @@ class LlmServiceAdapter:
             corrections=[
                 Correction(line=c.line, old=c.before, new=c.after, reason=c.reason) for c in response.changes
             ],
-            uncertain_lines=sorted({u.line for u in response.uncertain if u.line}),
+            uncertain=[
+                ReviewItem(line=u.line or None, reason=f"LLM không chắc '{u.text}': {u.note}", source="llm")
+                for u in response.uncertain
+            ],
             needs_review=response.needs_review,
             review_reasons=response.review_reasons,
         )

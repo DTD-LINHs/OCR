@@ -30,6 +30,15 @@ def test_rebuilds_python_indentation():
     )
 
 
+def test_stray_box_left_of_the_code_does_not_indent_it():
+    boxes = [
+        box("def f(x):", 4, 0),
+        box("return x", 8, 1),
+        box("~~", 0, 2),  # smudge in the margin, further left than the code
+    ]
+    assert build_layout(boxes).render() == "def f(x):\n    return x\n~~"
+
+
 def test_handwritten_indent_drift_stays_on_same_level():
     boxes = [
         box("for i in range(3):", 0, 0),
