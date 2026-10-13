@@ -7,6 +7,10 @@ from keycloak.keycloak_openid import KeycloakOpenID
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
 
+_OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+_CONFIGURED_LLM_PROVIDER = os.environ.get("LLM_PROVIDER")
+_DEFAULT_LLM_PROVIDER = _CONFIGURED_LLM_PROVIDER or ("openai" if _OPENAI_KEY else "mock")
+
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = os.environ.get("PROJECT_NAME", "FASTAPI_BASE")
@@ -39,16 +43,33 @@ class Settings(BaseSettings):
     OCR_LOW_CONFIDENCE: float = float(os.environ.get("OCR_LOW_CONFIDENCE", "0.8"))
     # Mean PaddleOCR box confidence below this -> "low_confidence" review reason
     OCR_REVIEW_CONFIDENCE: float = float(os.environ.get("OCR_REVIEW_CONFIDENCE", "0.75"))
+    SANDBOX_TIMEOUT: int = int(os.environ.get("SANDBOX_TIMEOUT", "15"))
+    SANDBOX_MEMORY: str = os.environ.get("SANDBOX_MEMORY", "256m")
+    SANDBOX_CPUS: float = float(os.environ.get("SANDBOX_CPUS", "0.5"))
+    SANDBOX_IMAGE: str = os.environ.get("SANDBOX_IMAGE", "sandbox-python:latest")
 
     # ---- LLM (sửa lỗi OCR + nhận xét bài) ----
     # LLM_PROVIDER=mock      : không gọi LLM thật, dùng để dev/test khi chưa có API key
     # LLM_PROVIDER=openai    : mọi API theo chuẩn OpenAI Chat Completions
     #                          (OpenAI, Gemini, Groq, OpenRouter, Ollama, vLLM, LM Studio...)
-    LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "mock")
-    LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
+    # If OPENAI_API_KEY is present and no provider is specified, use OpenAI.
+    # An explicit LLM_PROVIDER=mock still keeps the offline mock mode.
+    LLM_PROVIDER: str = _DEFAULT_LLM_PROVIDER
+    LLM_BASE_URL: str = os.environ.get(
+        "LLM_BASE_URL",
+        "https://api.openai.com/v1" if _DEFAULT_LLM_PROVIDER == "openai" else "http://localhost:11434/v1",
+    )
     # Dùng LLM_API_KEY; nếu để trống thì lấy OPENROUTER_API_KEY (tên biến nhóm đang dùng)
-    LLM_API_KEY: Optional[str] = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or None
-    LLM_MODEL: str = os.environ.get("LLM_MODEL", "qwen2.5-coder:7b")
+    LLM_API_KEY: Optional[str] = (
+        os.environ.get("LLM_API_KEY")
+        or _OPENAI_KEY
+        or os.environ.get("OPENROUTER_API_KEY")
+        or None
+    )
+    LLM_MODEL: str = os.environ.get(
+        "LLM_MODEL",
+        "gpt-4o-mini" if _DEFAULT_LLM_PROVIDER == "openai" else "qwen2.5-coder:7b",
+    )
     LLM_TEMPERATURE: float = float(os.environ.get("LLM_TEMPERATURE", "0"))
     LLM_TIMEOUT_SECONDS: float = float(os.environ.get("LLM_TIMEOUT_SECONDS", "180"))
     LLM_JSON_MODE: bool = os.environ.get("LLM_JSON_MODE", "true").lower() == "true"
@@ -58,7 +79,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _llm_key_fallback(self):
         if not self.LLM_API_KEY:
-            self.LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY") or None
+            self.LLM_API_KEY = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or None
         return self
 
 

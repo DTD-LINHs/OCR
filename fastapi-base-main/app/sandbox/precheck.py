@@ -1,4 +1,3 @@
-import ast
 from .base import RunResult, RunStatus
 
 def precheck(code: str) -> RunResult | None:
@@ -9,7 +8,7 @@ def precheck(code: str) -> RunResult | None:
             error_type="TypeError",
         )
     try:
-        ast.parse(code)
+        compile(code, "<sandbox>", "exec")
         return None
     except SyntaxError as e:
         return RunResult(

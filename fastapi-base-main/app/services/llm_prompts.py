@@ -37,9 +37,12 @@ DO NOT FIX (student errors, keep them exactly):
 - Spelling of identifiers the student chose (even if unusual), as long as it is consistent.
 
 AMBIGUOUS CASES:
-- Punctuation that OCR often drops (":" at the end of if/for/while/def, closing ")" or quote) MAY be restored,
-  but always report it with confidence "low" so the teacher can check it against the photo.
-- If you cannot tell whether something is an OCR error or a student error, KEEP IT UNCHANGED and list it in "uncertain".
+- Do not add punctuation merely because Python expects it. Restore a colon, closing parenthesis, quote, or
+  other punctuation ONLY when the photo clearly shows that the student wrote it and OCR dropped or changed it.
+- If the photo does not make the character clear, KEEP THE ORIGINAL OCR TEXT UNCHANGED and list it in "uncertain".
+- Any punctuation restored from a visually ambiguous character must use confidence "low".
+- Every change reason must describe the exact character difference. Do not claim a missing ")" if the OCR text
+  already contains ")"; state the actual missing or changed character instead.
 - Lines marked with a low OCR score are more likely to contain OCR errors.
 
 OUTPUT: a single JSON object, no markdown, no extra text:

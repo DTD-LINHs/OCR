@@ -139,10 +139,11 @@ class OcrPipeline:
                 self.llm_image_fn(image), draft, check.errors, log=recorder.on_llm_call
             )
             code = transcription.code
+            llm_corrections = _tag(transcription.corrections, "llm")
             version_id = recorder.on_code_version(
-                CodeStage.LLM_CORRECTED, code, transcription.corrections, language=language
+                CodeStage.LLM_CORRECTED, code, llm_corrections, language=language
             )
-            corrections += _tag(transcription.corrections, "llm")
+            corrections += llm_corrections
             check, sandbox_unavailable = self._check(code, language, version_id, recorder)
 
         # 5. What the teacher must look at

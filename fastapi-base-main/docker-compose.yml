@@ -38,6 +38,17 @@ services:
       db:
         condition: service_healthy
 
+  # Builds the disposable image used by app.sandbox.DockerRunner.
+  # The container itself exits immediately; DockerRunner creates one
+  # short-lived container per submitted program from this image.
+  sandbox-image:
+    build:
+      context: ./sandbox_image
+      dockerfile: Dockerfile
+    image: sandbox-python:latest
+    command: ["true"]
+    restart: "no"
+
   app:
     build:
       context: .
@@ -58,9 +69,12 @@ services:
       # Lets the app start sandbox containers on the host Docker daemon.
       # Access to this socket is root-equivalent on the host: keep the app trusted.
       - /var/run/docker.sock:/var/run/docker.sock
-    command: ["/app/entrypoint.sh"]
+    # Invoke through sh because the script is bind-mounted from the host.
+    command: ["/bin/sh", "/app/entrypoint.sh"]
     depends_on:
       db:
         condition: service_healthy
       alembic:
+        condition: service_completed_successfully
+      sandbox-image:
         condition: service_completed_successfully

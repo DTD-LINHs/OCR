@@ -118,6 +118,20 @@ def test_correct_ocr_good_fix(monkeypatch):
     assert res.syntax_ok is False and res.needs_review is True
 
 
+def test_uncertain_line_is_not_applied(monkeypatch):
+    fake_llm(monkeypatch, {
+        "code": "x = 1\nprint(x)",
+        "changes": [{"line": 1, "before": "x = l", "after": "x = 1", "reason": "OCR", "confidence": "high"}],
+        "uncertain": [{"line": 1, "text": "x = l", "note": "Không chắc là OCR hay sinh viên"}],
+    })
+
+    res = service().correct_ocr(CorrectOcrRequest(ocr_text="x = l\nprint(x)"))
+
+    assert res.code == "x = l\nprint(x)"
+    assert res.changes == []
+    assert res.needs_review is True
+
+
 def test_correct_ocr_flags_rewrite(monkeypatch):
     """LLM viết lại cả bài -> phải bị đánh dấu needs_review."""
     rewritten = "import math\n\ndef factorial(n):\n    return math.factorial(n)\n\nprint(factorial(int(input())))"

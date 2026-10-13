@@ -26,7 +26,7 @@ from app.schemas.sche_ocr_pipeline import (
     SandboxResult,
 )
 from app.services.srv_base import BaseService
-from app.services.srv_ocr_adapters import LlmServiceAdapter, PrecheckSandbox
+from app.services.srv_ocr_adapters import DockerSandbox, LlmServiceAdapter
 from app.services.srv_ocr_pipeline import OcrPipeline
 from app.utils.enums import CodeStage, OcrStatus
 from app.utils.exception_handler import CustomException, ExceptionType
@@ -50,7 +50,7 @@ def get_pipeline() -> OcrPipeline:
             rec_model=settings.OCR_REC_MODEL,
         ),
         llm=LlmServiceAdapter(),
-        sandbox=PrecheckSandbox(),
+        sandbox=DockerSandbox(),
         low_confidence_threshold=settings.OCR_LOW_CONFIDENCE,
         review_confidence_threshold=settings.OCR_REVIEW_CONFIDENCE,
     )

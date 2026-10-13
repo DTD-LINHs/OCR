@@ -300,6 +300,7 @@ class LLMService:
                 ))
             except (TypeError, ValueError, AttributeError):
                 continue
+        changes = [change for change in changes if change.before != change.after]
         if not changes and code != ocr_text.rstrip():
             changes = line_diff(ocr_text.rstrip(), code)
 
@@ -310,6 +311,19 @@ class LLMService:
                     line=int(u.get("line") or 0), text=str(u.get("text", "")), note=str(u.get("note", ""))))
             except (TypeError, ValueError, AttributeError):
                 continue
+
+        # Enforce the safety rule in code, not only in the prompt. If the LLM
+        # marks a line as uncertain, never apply its replacement for that line.
+        uncertain_lines = {item.line for item in uncertain if item.line > 0}
+        if uncertain_lines:
+            original_lines = ocr_text.rstrip().split("\n")
+            corrected_lines = code.split("\n")
+            for line_no in uncertain_lines:
+                index = line_no - 1
+                if index < len(original_lines) and index < len(corrected_lines):
+                    corrected_lines[index] = original_lines[index]
+            code = "\n".join(corrected_lines)
+            changes = [change for change in changes if change.line not in uncertain_lines]
 
         # ---- Kiểm tra an toàn: LLM có đang "viết lại" code thay vì chỉ sửa lỗi OCR không?
         syntax_ok, syntax_error = check_syntax(code)

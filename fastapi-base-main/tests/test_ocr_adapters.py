@@ -3,7 +3,8 @@ import base64
 import pytest
 
 from app.schemas.sche_ocr_pipeline import CodeLine, LayoutResult, SyntaxIssue
-from app.services.srv_ocr_adapters import LlmServiceAdapter, PrecheckSandbox
+from app.sandbox.base import RunResult, RunStatus
+from app.services.srv_ocr_adapters import DockerSandbox, LlmServiceAdapter, PrecheckSandbox
 from app.utils.exception_handler import CustomException
 
 
@@ -66,6 +67,7 @@ def test_llm_adapter_sends_rendered_lines_scores_and_image():
     request = service.requests[0]
     assert request.ocr_text == "if x:\n    y = l"
     assert [(line.text, line.score) for line in request.lines] == [("if x:", 0.99), ("    y = l", 0.5)]
+    assert request.syntax_error == "line 2: invalid syntax\nunexpected EOF"
     assert base64.b64decode(request.image_base64) == b"jpeg"
     assert [(u.line, u.source, u.reason) for u in result.uncertain] == [(1, "llm", "LLM không chắc 'x': có thể là ×")]
     assert result.needs_review is True
@@ -92,3 +94,32 @@ def test_precheck_sandbox():
     bad = sandbox.check("def f(x)\n    return x\n", "python")
     assert not bad.ok
     assert bad.errors[0].line == 1
+
+
+def test_docker_sandbox_maps_execution_result():
+    class FakeRunner:
+        image = "sandbox-python:test"
+
+        def __init__(self):
+            self.calls = []
+
+        def run_with_precheck(self, code, timeout_s):
+            self.calls.append((code, timeout_s))
+            return RunResult(
+                status=RunStatus.RUNTIME_ERROR,
+                stderr="NameError: name 'x' is not defined",
+                exit_code=1,
+                error_type="NameError",
+                error_line=2,
+                duration_ms=12,
+            )
+
+    runner = FakeRunner()
+    sandbox = DockerSandbox(runner)
+    result = sandbox.check("print(x)", "Python3")
+
+    assert runner.calls == [("print(x)", sandbox.timeout_s)]
+    assert result.ok is False
+    assert result.image == "sandbox-python:test"
+    assert result.errors[0].line == 2
+    assert "NameError" in result.errors[0].message
