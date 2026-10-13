@@ -1,0 +1,55 @@
+x-common: &common
+  restart: always
+  env_file:
+    - .env
+
+x-common-volumes: &common-volumes
+  volumes:
+    - ./app:/app/app
+    - ./alembic:/app/alembic
+    - ./requirements.txt:/app/requirements.txt
+    - ./.env:/app/.env
+    - ./entrypoint.sh:/app/entrypoint.sh
+
+services:
+  db:
+    image: postgres:16
+    <<: *common
+    volumes:
+      - ./mount-data/db:/var/lib/postgresql/data
+    ports:
+      - 5555:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  alembic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    <<: 
+      - *common
+      - *common-volumes
+    command: [ "alembic", "upgrade", "head" ]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    <<: 
+      - *common
+      - *common-volumes
+    ports:
+      - 8000:8000
+    command: ["/app/entrypoint.sh"]
+    depends_on:
+      db:
+        condition: service_healthy
+      alembic:
+        condition: service_completed_successfully
