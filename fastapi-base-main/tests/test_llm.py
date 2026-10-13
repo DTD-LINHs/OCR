@@ -1,0 +1,358 @@
+"""Test phần LLM, không cần database và không cần LLM thật.
+
+Chạy:  pytest tests/test_llm.py -v
+"""
+
+import json
+
+import httpx
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from app.api.v1 import api_llm
+from app.core.config import settings
+from app.schemas.sche_llm import CorrectOcrRequest, ReviewRequest, TestCaseResult
+from app.services import llm_prompts as P
+from app.services import srv_llm
+from app.services.srv_llm import LLMClient, LLMService, extract_json
+from app.utils.exception_handler import CustomException, custom_error_handler
+
+
+# ---------------------------------------------------------------- helpers
+def make_app() -> TestClient:
+    """App tối giản chỉ có router LLM (app chính cần Postgres mới khởi động được)."""
+    app = FastAPI()
+    app.include_router(api_llm.router, prefix="/api/v1")
+    app.add_exception_handler(CustomException, custom_error_handler)
+    return TestClient(app)
+
+
+def fake_llm(monkeypatch, reply: dict | str | list, status_first: int | None = None, seen: list | None = None):
+    """Thay httpx.Client bằng server giả trả về `reply` theo chuẩn OpenAI.
+
+    `reply` là list -> mỗi lần gọi lấy 1 phần tử theo thứ tự (phần tử cuối dùng cho các lần sau).
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        body = json.loads(request.content)
+        if seen is not None:
+            seen.append(body)
+        if status_first and calls["n"] == 1:
+            return httpx.Response(status_first, json={"error": "response_format not supported"})
+        r = reply[min(calls["n"], len(reply)) - 1] if isinstance(reply, list) else reply
+        content = r if isinstance(r, str) else json.dumps(r, ensure_ascii=False)
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    real_client = httpx.Client
+    monkeypatch.setattr(srv_llm.httpx, "Client",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    return calls
+
+
+def service(provider="openai") -> LLMService:
+    c = LLMClient()
+    c.provider, c.model = provider, "fake-model"
+    return LLMService(client=c)
+
+
+OCR_IMG0 = """num = int Cviput ("Enter a number ")
+Ans =1
+while num 21 :
+    Ans *= num
+    mum-=1
+retusn Ans"""
+
+
+# ---------------------------------------------------------------- extract_json
+def test_extract_json_handles_fences_and_noise():
+    assert extract_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert extract_json('Here you go: {"a": 2} hope it helps') == {"a": 2}
+    assert extract_json("not json") is None
+
+
+# ---------------------------------------------------------------- mock provider qua API
+def test_api_correct_ocr_mock():
+    srv = service("mock")
+    api_llm.llm_service = srv
+    r = make_app().post("/api/v1/llm/correct-ocr", json={"ocr_text": "DEF MAIN():\n    MOUSE-X = 1"})
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["code"] == "def MAIN():\n    MOUSE_X = 1"
+    assert data["syntax_ok"] is True
+    assert len(data["changes"]) == 2
+
+
+def test_api_review_mock():
+    api_llm.llm_service = service("mock")
+    body = {"problem": "Tính giai thừa", "code": "print(1)", "max_score": 10,
+            "test_results": [{"name": "t1", "passed": True}, {"name": "t2", "passed": False}]}
+    r = make_app().post("/api/v1/llm/review", json=body)
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert (data["passed_tests"], data["total_tests"]) == (1, 2)
+    assert data["suggested_score"] == 5.0
+    assert set(data) >= {"general", "solution_guide", "conclusion"}   # đủ 3 phần
+    assert data["conclusion"]["verdict"] == "partially_correct"
+
+
+def test_api_validation_error_on_missing_field():
+    api_llm.llm_service = service("mock")
+    r = make_app().post("/api/v1/llm/review", json={"code": "x"})   # thiếu problem
+    assert r.status_code == 422
+
+
+# ---------------------------------------------------------------- provider thật (server giả)
+def test_correct_ocr_good_fix(monkeypatch):
+    fixed = ('num = int(input("Enter a number: "))\nAns = 1\nwhile num > 1:\n'
+             '    Ans *= num\n    num -= 1\nreturn Ans')
+    fake_llm(monkeypatch, {"code": fixed, "changes": [
+        {"line": 6, "before": "retusn Ans", "after": "return Ans", "reason": "OCR", "confidence": "high"}],
+        "uncertain": []})
+    res = service().correct_ocr(CorrectOcrRequest(ocr_text=OCR_IMG0))
+    assert res.code == fixed
+    assert res.similarity > 0.8
+    # 'return' ngoài hàm là lỗi cú pháp của chính sinh viên -> báo lại, không tự sửa
+    assert res.syntax_ok is False and res.needs_review is True
+
+
+def test_correct_ocr_flags_rewrite(monkeypatch):
+    """LLM viết lại cả bài -> phải bị đánh dấu needs_review."""
+    rewritten = "import math\n\ndef factorial(n):\n    return math.factorial(n)\n\nprint(factorial(int(input())))"
+    fake_llm(monkeypatch, {"code": rewritten, "changes": [], "uncertain": []})
+    res = service().correct_ocr(CorrectOcrRequest(ocr_text=OCR_IMG0))
+    assert res.needs_review is True
+    assert any("viết lại" in r for r in res.review_reasons)
+    assert res.changes, "khi LLM không liệt kê thay đổi, service phải tự tính diff"
+
+
+def test_correct_ocr_retries_without_json_mode(monkeypatch):
+    seen = []
+    calls = fake_llm(monkeypatch, {"code": "x = 1", "changes": []}, status_first=400, seen=seen)
+    monkeypatch.setattr(settings, "LLM_JSON_MODE", True)
+    service().correct_ocr(CorrectOcrRequest(ocr_text="x = l"))
+    assert calls["n"] == 2
+    assert "response_format" in seen[0] and "response_format" not in seen[1]
+
+
+def test_correct_ocr_sends_scores_and_example(monkeypatch):
+    seen = []
+    fake_llm(monkeypatch, {"code": "x = 1"}, seen=seen)
+    service().correct_ocr(CorrectOcrRequest(ocr_text="x = l", lines=[{"text": "x = l", "score": 0.42}]))
+    msgs = seen[0]["messages"]
+    assert msgs[0]["role"] == "system" and "NOT" in msgs[0]["content"]
+    assert len(msgs) == 4                      # system + ví dụ (user, assistant) + input thật
+    assert "1 | 0.42 | x = l" in msgs[-1]["content"]
+
+
+def test_llm_bad_json_gives_502(monkeypatch):
+    fake_llm(monkeypatch, "Sorry, I cannot help with that.")
+    with pytest.raises(CustomException) as e:
+        service().correct_ocr(CorrectOcrRequest(ocr_text="x = 1"))
+    assert e.value.http_code == 502
+
+
+def test_llm_unreachable_gives_503(monkeypatch):
+    def boom(request):
+        raise httpx.ConnectError("refused")
+    real_client = httpx.Client
+    monkeypatch.setattr(srv_llm.httpx, "Client",
+                        lambda **kw: real_client(transport=httpx.MockTransport(boom), **kw))
+    with pytest.raises(CustomException) as e:
+        service().correct_ocr(CorrectOcrRequest(ocr_text="x = 1"))
+    assert e.value.http_code == 503
+
+
+def test_review_clamps_score_and_coerces_fields(monkeypatch):
+    fake_llm(monkeypatch, {"general": {"requirements_comment": "r"}, "solution_guide": {"approach": "a"},
+                           "conclusion": {"summary": "ok"}, "suggested_score": 15,
+                           "issues": [{"line": "3", "type": "Logic Error", "severity": "HIGH",
+                                       "explanation": "e", "suggestion": "s"}]})
+    res = service().review(ReviewRequest(problem="p", code="c", max_score=10,
+                                         test_results=[TestCaseResult(passed=True)]))
+    assert res.suggested_score == 10            # không vượt thang điểm
+    assert res.general.issues[0].line == 3
+    assert res.general.issues[0].type == "logic"        # giá trị lạ -> mặc định
+    assert res.general.issues[0].severity == "high"
+
+
+def test_review_prompt_hides_hidden_tests():
+    prompt = P.build_review_user(
+        "p", "c",
+        [TestCaseResult(name="public", input="5", expected="120", actual="120", passed=True),
+         TestCaseResult(name="secret", input="SECRET_IN", expected="SECRET_OUT", actual="1", passed=False, hidden=True)],
+        None, None, 10)
+    assert "public" in prompt and "120" in prompt
+    assert "SECRET_IN" not in prompt and "SECRET_OUT" not in prompt
+    assert "(1/2 passed)" in prompt
+
+
+# ---------------------------------------------------------------- nhận xét 3 phần + kiểm tra của server
+FACT_CODE = 'n = int(input("Nhap n: "))\nresult = 0\nfor i in range(1, n + 1):\n    result *= i\nprint(result)'
+
+GOOD_REVIEW = {
+    "general": {
+        "meets_requirements": "no",
+        "requirements_comment": "Kết quả luôn bằng 0.",
+        "standard_comment": "Có chuỗi gợi ý trong input().",
+        "optimization_comment": "O(n) là phù hợp.",
+        "complexity": "O(n)",
+        "issues": [
+            {"line": 1, "code_snippet": 'input("Nhap n: ")', "type": "io_format", "severity": "medium",
+             "explanation": "Chuỗi gợi ý bị in ra output", "suggestion": "Bỏ chuỗi trong input()"},
+            {"line": 2, "code_snippet": "result = 0", "type": "logic", "severity": "high",
+             "explanation": "Nhân với 0 luôn ra 0", "suggestion": "Khởi tạo bằng 1"},
+        ],
+    },
+    "solution_guide": {
+        "approach": "Nhân dồn từ 1 đến n",
+        "steps": ["Đọc n", "Khởi tạo kết quả bằng 1", "Nhân dồn", "In kết quả"],
+        "pseudocode": "ĐỌC n\nkq <- 1\nLẶP i TỪ 1 ĐẾN n: kq <- kq * i\nIN kq",
+        "expected_complexity": "O(n)",
+    },
+    "conclusion": {"verdict": "incorrect", "summary": "Sai vì khởi tạo result = 0."},
+    "suggested_score": 3, "score_explanation": "...", "feedback_for_student": "Xem lại giá trị khởi tạo.",
+}
+
+
+def review_req(**kw):
+    base = dict(problem="Tính n!", code=FACT_CODE, max_score=10,
+                test_results=[TestCaseResult(name="n=5", input="5", expected="120", actual="0", passed=False)])
+    base.update(kw)
+    return ReviewRequest(**base)
+
+
+def test_review_three_parts_parsed(monkeypatch):
+    fake_llm(monkeypatch, GOOD_REVIEW)
+    res = service().review(review_req())
+    assert res.general.meets_requirements == "no" and res.general.complexity == "O(n)"
+    assert [i.type for i in res.general.issues] == ["io_format", "logic"]
+    assert res.general.issues[1].code_snippet == "result = 0"
+    assert len(res.solution_guide.steps) == 4
+    assert res.conclusion.verdict == "incorrect"
+    assert res.warnings == []                    # review tốt -> không có cảnh báo
+
+
+def test_review_warns_when_guide_contains_real_code(monkeypatch):
+    bad = json.loads(json.dumps(GOOD_REVIEW))
+    bad["solution_guide"]["pseudocode"] = "n = int(input())\nr = 1\nfor i in range(1, n + 1):\n    r *= i\nprint(r)"
+    fake_llm(monkeypatch, bad)
+    res = service().review(review_req())
+    assert any("mã giả" in w for w in res.warnings)
+
+
+def test_review_warns_on_missed_input_prompt(monkeypatch):
+    bad = json.loads(json.dumps(GOOD_REVIEW))
+    bad["general"]["issues"] = bad["general"]["issues"][1:]   # LLM bỏ sót lỗi prompt trong input()
+    fake_llm(monkeypatch, bad)
+    res = service().review(review_req())
+    assert any("input()" in w and "[1]" in w for w in res.warnings)
+
+
+def test_review_warns_on_verdict_mismatch_and_hidden_leak(monkeypatch):
+    bad = json.loads(json.dumps(GOOD_REVIEW))
+    bad["conclusion"]["verdict"] = "correct"
+    bad["feedback_for_student"] = "Em sai test có đầu vào 12345."
+    fake_llm(monkeypatch, bad)
+    res = service().review(review_req(test_results=[
+        TestCaseResult(name="hidden1", input="12345", expected="x", actual="0", passed=False, hidden=True)]))
+    assert any("correct" in w and "0/1" in w for w in res.warnings)
+    assert any("test ẩn" in w for w in res.warnings)
+
+
+def test_pseudocode_detector():
+    assert not srv_llm.looks_like_real_code("LẶP i TỪ 1 ĐẾN n: kq <- kq * i")
+    assert not srv_llm.looks_like_real_code("FOR i FROM 1 TO n:\n    result <- result * i")
+    assert srv_llm.looks_like_real_code("for i in range(5):\n    print(i)")
+
+
+# ---------------------------------------------------------------- gửi kèm ảnh + OpenRouter
+def test_correct_ocr_sends_image_as_multipart(monkeypatch):
+    seen = []
+    fake_llm(monkeypatch, {"code": "x = 1"}, seen=seen)
+    res = service().correct_ocr(CorrectOcrRequest(ocr_text="x = l", image_base64="QUJD"))
+    content = seen[0]["messages"][-1]["content"]
+    assert isinstance(content, list) and content[0]["type"] == "text"
+    assert "PHOTO" in content[0]["text"] and "x = l" in content[0]["text"]
+    assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,QUJD"}}
+    assert res.used_image is True
+
+
+def test_correct_ocr_without_image_sends_plain_text(monkeypatch):
+    seen = []
+    fake_llm(monkeypatch, {"code": "x = 1"}, seen=seen)
+    res = service().correct_ocr(CorrectOcrRequest(ocr_text="x = l"))
+    assert isinstance(seen[0]["messages"][-1]["content"], str)
+    assert res.used_image is False
+
+
+def test_image_too_large_rejected():
+    with pytest.raises(CustomException) as e:
+        srv_llm.image_part("A" * (srv_llm.MAX_IMAGE_CHARS + 1), None)
+    assert e.value.http_code == 413
+
+
+def test_openrouter_key_env_fallback(monkeypatch):
+    import importlib
+    from app.core import config
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    assert config.Settings().LLM_API_KEY == "sk-or-test"
+    monkeypatch.setenv("LLM_API_KEY", "sk-direct")
+    assert config.Settings().LLM_API_KEY == "sk-direct"
+
+
+# ---------------------------------------------------------------- test ẩn: không gửi tên test
+def test_review_prompt_hides_hidden_test_name():
+    prompt = P.build_review_user(
+        "Tính n!", "c",
+        [TestCaseResult(name="n=5", input="5", expected="120", actual="0", passed=False),
+         TestCaseResult(name="n=0", input="0", expected="1", actual="0", passed=False, hidden=True)],
+        None, None, 10)
+    assert "n=5" in prompt                       # test công khai vẫn giữ tên
+    assert "n=0" not in prompt                   # tên test ẩn đã lộ input -> không được gửi
+    assert "- hidden test 2: FAIL" in prompt
+    assert "hidden test N" in P.REVIEW_SYSTEM and "feedback_for_student" in P.REVIEW_SYSTEM
+
+
+# ---------------------------------------------------------------- JSON thiếu trường -> gọi lại 1 lần -> 502
+def test_review_retries_once_when_parts_missing(monkeypatch):
+    calls = fake_llm(monkeypatch, [{"suggested_score": 5}, GOOD_REVIEW])
+    res = service().review(review_req())
+    assert calls["n"] == 2
+    assert res.conclusion.verdict == "incorrect" and res.general.issues
+
+
+def test_review_missing_parts_twice_gives_502_and_logs_raw(monkeypatch, caplog):
+    calls = fake_llm(monkeypatch, {"general": {}, "suggested_score": 5, "note": "RAW_MARKER"})
+    with caplog.at_level("WARNING", logger=srv_llm.logger.name), pytest.raises(CustomException) as e:
+        service().review(review_req())
+    assert calls["n"] == 2                       # chỉ thử lại đúng 1 lần
+    assert e.value.http_code == 502
+    assert all(k in e.value.message for k in ("general", "solution_guide", "conclusion"))
+    assert "RAW_MARKER" in caplog.text           # có ghi output thô của LLM
+
+
+def test_raw_log_is_truncated(monkeypatch, caplog):
+    fake_llm(monkeypatch, {"code": "", "pad": "x" * 5000})
+    with caplog.at_level("WARNING", logger=srv_llm.logger.name), pytest.raises(CustomException):
+        service().correct_ocr(CorrectOcrRequest(ocr_text="x = 1"))
+    assert len(caplog.records) == 2              # 1 dòng log cho mỗi lần gọi
+    assert all(len(r.getMessage()) < LLMService.MAX_RAW_LOG + 200 for r in caplog.records)
+
+
+def test_correct_ocr_retries_when_code_missing(monkeypatch):
+    calls = fake_llm(monkeypatch, [{"changes": []}, {"code": "x = 1", "changes": []}])
+    res = service().correct_ocr(CorrectOcrRequest(ocr_text="x = l"))
+    assert calls["n"] == 2 and res.code == "x = 1"
+
+
+def test_api_correct_ocr_missing_code_gives_502(monkeypatch):
+    calls = fake_llm(monkeypatch, {"code": "   ", "changes": []})
+    api_llm.llm_service = service()
+    r = make_app().post("/api/v1/llm/correct-ocr", json={"ocr_text": "x = l"})
+    assert calls["n"] == 2
+    assert r.status_code == 502
+    assert "code" in r.json()["message"] and "thử lại" in r.json()["message"]
