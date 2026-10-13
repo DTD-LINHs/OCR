@@ -47,6 +47,17 @@ services:
       - *common-volumes
     ports:
       - 8000:8000
+    # Merge keys (<<) do not concatenate lists, so the shared volumes are repeated here.
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+      - ./requirements.txt:/app/requirements.txt
+      - ./.env:/app/.env
+      - ./entrypoint.sh:/app/entrypoint.sh
+      - ./mount-data/uploads:/app/mount-data/uploads
+      # Lets the app start sandbox containers on the host Docker daemon.
+      # Access to this socket is root-equivalent on the host: keep the app trusted.
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["/app/entrypoint.sh"]
     depends_on:
       db:

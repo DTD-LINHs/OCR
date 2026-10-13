@@ -6,7 +6,8 @@ ENV PYTHONUNBUFFERED=1
 
 RUN apt update 
 RUN apt upgrade -y 
-RUN apt install -y nano unixodbc unixodbc-dev
+# libgl1/libglib2.0-0 are needed by OpenCV (PaddleOCR)
+RUN apt install -y nano unixodbc unixodbc-dev libgl1 libglib2.0-0
 
 WORKDIR /app
 
