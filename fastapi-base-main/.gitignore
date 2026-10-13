@@ -82,3 +82,6 @@ docker/
 */.DS_Store
 
 mount-data/
+# macOS archive junk
+.DS_Store
+__MACOSX/
