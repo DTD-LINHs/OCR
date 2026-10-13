@@ -84,7 +84,15 @@ never what the code should have been. If the photo shows a student mistake, keep
 """
 
 
-def build_correct_ocr_user(ocr_text: str, scores: list, problem: str | None) -> str:
+CORRECT_OCR_SYNTAX_NOTE = """\
+A syntax check of the OCR text reported: {syntax_error}. This error may come from an OCR misreading
+OR from the student's own mistake. Fix it ONLY if the photo shows the student wrote it correctly and
+OCR misread it. If the student really wrote it that way, keep it unchanged and list it in 'uncertain'.
+"""
+
+
+def build_correct_ocr_user(ocr_text: str, scores: list, problem: str | None,
+                           syntax_error: str | None = None) -> str:
     lines = ocr_text.replace("\r\n", "\n").split("\n")
     rows = []
     for i, text in enumerate(lines, 1):
@@ -93,6 +101,8 @@ def build_correct_ocr_user(ocr_text: str, scores: list, problem: str | None) -> 
     parts = []
     if problem:
         parts.append(f"Problem statement (only to help recognise identifiers, do NOT use it to fix logic):\n{problem}\n")
+    if syntax_error and syntax_error.strip():
+        parts.append(CORRECT_OCR_SYNTAX_NOTE.format(syntax_error=syntax_error.strip()))
     parts.append("OCR output (line number | OCR score | text):\n" + "\n".join(rows))
     return "\n".join(parts)
 

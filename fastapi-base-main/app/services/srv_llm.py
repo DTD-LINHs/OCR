@@ -269,7 +269,7 @@ class LLMService:
         if self.client.provider == "mock":
             data = self._mock_correct(ocr_text)
         else:
-            user_text = P.build_correct_ocr_user(ocr_text, scores, req.problem)
+            user_text = P.build_correct_ocr_user(ocr_text, scores, req.problem, req.syntax_error)
             if image:
                 # Định dạng tin nhắn nhiều phần (text + ảnh) theo chuẩn OpenAI, OpenRouter cũng dùng
                 user_content: Any = [{"type": "text", "text": P.CORRECT_OCR_IMAGE_NOTE + "\n" + user_text}, image]

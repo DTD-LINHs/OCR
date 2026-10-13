@@ -356,3 +356,25 @@ def test_api_correct_ocr_missing_code_gives_502(monkeypatch):
     assert calls["n"] == 2
     assert r.status_code == 502
     assert "code" in r.json()["message"] and "thử lại" in r.json()["message"]
+
+
+# ---------------------------------------------------------------- correct-ocr: gửi kèm syntax_error
+def test_correct_ocr_prompt_includes_syntax_error():
+    prompt = P.build_correct_ocr_user("x = l", [], None, "Dòng 6: 'return' outside function")
+    assert "A syntax check of the OCR text reported: Dòng 6: 'return' outside function." in prompt
+    assert "OCR misreading" in prompt and "student's own mistake" in prompt
+    assert "keep it unchanged and list it in 'uncertain'" in prompt
+
+
+def test_correct_ocr_prompt_unchanged_without_syntax_error():
+    old = "OCR output (line number | OCR score | text):\n1 | 0.42 | x = l"
+    assert P.build_correct_ocr_user("x = l", [0.42], None) == old
+    assert P.build_correct_ocr_user("x = l", [0.42], None, None) == old
+    assert P.build_correct_ocr_user("x = l", [0.42], None, "  ") == old
+
+
+def test_service_passes_syntax_error_to_prompt(monkeypatch):
+    seen = []
+    fake_llm(monkeypatch, {"code": "x = 1"}, seen=seen)
+    service().correct_ocr(CorrectOcrRequest(ocr_text="x = l", syntax_error="Dòng 3: invalid syntax"))
+    assert "reported: Dòng 3: invalid syntax." in seen[0]["messages"][-1]["content"]
