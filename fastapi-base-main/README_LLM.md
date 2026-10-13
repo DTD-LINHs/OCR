@@ -95,10 +95,18 @@ Mọi response đều bọc trong `DataResponse` của bộ khung: `{http_code, 
   "ocr_text": "retusn Ans\n...",
   "lines": [{"text": "retusn Ans", "score": 0.81}],
   "language": "python",
-  "problem": "Viết chương trình tính giai thừa"
+  "problem": "Viết chương trình tính giai thừa",
+  "syntax_error": "Dòng 6: 'return' outside function"
 }
 ```
 Chỉ `ocr_text` là bắt buộc. `lines[].score` (độ tin cậy của PaddleOCR) và `problem` giúp LLM sửa chính xác hơn.
+
+`syntax_error` (không bắt buộc): lỗi cú pháp của bản OCR, do bên gọi tự kiểm tra trước (vd. `compile()` của Python),
+dạng `"Dòng <n>: <thông báo>"`. Khi có trường này, prompt nói thêm cho LLM biết lỗi đó **có thể do OCR đọc sai hoặc
+do chính sinh viên viết sai**, còn nếu sinh viên thật sự viết như vậy thì giữ nguyên và đưa vào `uncertain`.
+Có gửi ảnh: chỉ sửa khi ảnh cho thấy sinh viên viết đúng mà OCR đọc nhầm. Không gửi ảnh: chỉ sửa khi rõ ràng là OCR
+đọc nhầm ký tự (từ khóa, ký hiệu bị méo). Không gửi `syntax_error` thì prompt giữ như cũ. Trường này phát huy tác dụng
+nhất khi gửi kèm ảnh gốc (xem bên dưới).
 
 **Gửi kèm ảnh gốc (khuyến nghị nếu model nhận ảnh):** thêm `"image_base64": "<base64 của ảnh>"`
 (hoặc data URL `data:image/jpeg;base64,...`, hoặc `"image_url": "https://..."`). Khi có ảnh, LLM đối chiếu

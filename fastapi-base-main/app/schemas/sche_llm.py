@@ -29,6 +29,9 @@ class CorrectOcrRequest(BaseModel):
                            "Gửi kèm để LLM đối chiếu với chữ viết thật. Chỉ dùng với model nhận ảnh.")
     )
     image_url: Optional[str] = Field(None, description="Không bắt buộc. URL ảnh bài làm (thay cho image_base64)")
+    syntax_error: Optional[str] = Field(
+        None, description="Không bắt buộc. Lỗi cú pháp sau OCR, vd. \"Dòng 6: 'return' outside function\""
+    )
 
 
 class CodeChange(BaseModel):

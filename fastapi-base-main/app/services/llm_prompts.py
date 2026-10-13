@@ -84,7 +84,23 @@ never what the code should have been. If the photo shows a student mistake, keep
 """
 
 
-def build_correct_ocr_user(ocr_text: str, scores: list, problem: str | None) -> str:
+CORRECT_OCR_SYNTAX_NOTE = """\
+A syntax check of the OCR text reported: {syntax_error}. This error may come from an OCR misreading
+OR from the student's own mistake. Fix it ONLY if the photo shows the student wrote it correctly and
+OCR misread it. If the student really wrote it that way, keep it unchanged and list it in 'uncertain'.
+"""
+
+# Dùng khi KHÔNG gửi ảnh: không nhắc tới ảnh, chỉ sửa khi rõ ràng là OCR đọc nhầm ký tự
+CORRECT_OCR_SYNTAX_NOTE_NO_IMAGE = """\
+A syntax check of the OCR text reported: {syntax_error}. This error may come from an OCR misreading
+OR from the student's own mistake. Fix it ONLY if it is clearly a character-level OCR misreading
+(e.g. a garbled keyword or symbol). If it could be what the student actually wrote, keep it unchanged
+and list it in 'uncertain'.
+"""
+
+
+def build_correct_ocr_user(ocr_text: str, scores: list, problem: str | None,
+                           syntax_error: str | None = None, has_image: bool = False) -> str:
     lines = ocr_text.replace("\r\n", "\n").split("\n")
     rows = []
     for i, text in enumerate(lines, 1):
@@ -93,6 +109,9 @@ def build_correct_ocr_user(ocr_text: str, scores: list, problem: str | None) -> 
     parts = []
     if problem:
         parts.append(f"Problem statement (only to help recognise identifiers, do NOT use it to fix logic):\n{problem}\n")
+    if syntax_error and syntax_error.strip():
+        note = CORRECT_OCR_SYNTAX_NOTE if has_image else CORRECT_OCR_SYNTAX_NOTE_NO_IMAGE
+        parts.append(note.format(syntax_error=syntax_error.strip()))
     parts.append("OCR output (line number | OCR score | text):\n" + "\n".join(rows))
     return "\n".join(parts)
 
