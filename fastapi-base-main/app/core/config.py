@@ -1,5 +1,6 @@
 import os
 from typing import Optional
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 from keycloak.keycloak_openid import KeycloakOpenID
 
@@ -27,6 +28,27 @@ class Settings(BaseSettings):
     KEYCLOAK_CLIENT_SECRET: Optional[str] = os.environ.get("KEYCLOAK_CLIENT_SECRET", None)
     KEYCLOAK_VERIFY: Optional[bool] = os.environ.get("KEYCLOAK_VERIFY", "False").lower() == "true"
     GOOGLE_CLIENT_ID: Optional[str] = os.environ.get("GOOGLE_CLIENT_ID", None)
+
+    # ---- LLM (sửa lỗi OCR + nhận xét bài) ----
+    # LLM_PROVIDER=mock      : không gọi LLM thật, dùng để dev/test khi chưa có API key
+    # LLM_PROVIDER=openai    : mọi API theo chuẩn OpenAI Chat Completions
+    #                          (OpenAI, Gemini, Groq, OpenRouter, Ollama, vLLM, LM Studio...)
+    LLM_PROVIDER: str = os.environ.get("LLM_PROVIDER", "mock")
+    LLM_BASE_URL: str = os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1")
+    # Dùng LLM_API_KEY; nếu để trống thì lấy OPENROUTER_API_KEY (tên biến nhóm đang dùng)
+    LLM_API_KEY: Optional[str] = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or None
+    LLM_MODEL: str = os.environ.get("LLM_MODEL", "qwen2.5-coder:7b")
+    LLM_TEMPERATURE: float = float(os.environ.get("LLM_TEMPERATURE", "0"))
+    LLM_TIMEOUT_SECONDS: float = float(os.environ.get("LLM_TIMEOUT_SECONDS", "180"))
+    LLM_JSON_MODE: bool = os.environ.get("LLM_JSON_MODE", "true").lower() == "true"
+    # Nếu code sau khi sửa giống bản OCR dưới ngưỡng này -> đánh dấu cần giảng viên xem
+    LLM_MIN_SIMILARITY: float = float(os.environ.get("LLM_MIN_SIMILARITY", "0.7"))
+
+    @model_validator(mode="after")
+    def _llm_key_fallback(self):
+        if not self.LLM_API_KEY:
+            self.LLM_API_KEY = os.environ.get("OPENROUTER_API_KEY") or None
+        return self
 
 
 settings = Settings()
