@@ -26,9 +26,8 @@ from app.schemas.sche_ocr_pipeline import (
     SandboxResult,
 )
 from app.services.srv_base import BaseService
-from app.services.srv_llm_code import OpenAICodeLlm
+from app.services.srv_ocr_adapters import LlmServiceAdapter, PrecheckSandbox
 from app.services.srv_ocr_pipeline import OcrPipeline
-from app.services.srv_sandbox import LANGUAGES, DockerSandbox, SandboxConfig
 from app.utils.enums import CodeStage, OcrStatus
 from app.utils.exception_handler import CustomException, ExceptionType
 from app.utils.image import InvalidImage, decode_image
@@ -50,21 +49,8 @@ def get_pipeline() -> OcrPipeline:
             det_model=settings.OCR_DET_MODEL,
             rec_model=settings.OCR_REC_MODEL,
         ),
-        llm=OpenAICodeLlm(
-            api_key=settings.OPENAI_API_KEY,
-            model=settings.OPENAI_MODEL,
-            timeout=settings.OPENAI_TIMEOUT,
-            supported_languages=tuple(LANGUAGES),
-        ),
-        sandbox=DockerSandbox(
-            SandboxConfig(
-                timeout_s=settings.SANDBOX_TIMEOUT,
-                memory=settings.SANDBOX_MEMORY,
-                cpus=settings.SANDBOX_CPUS,
-                runtime=settings.SANDBOX_RUNTIME,
-            )
-        ),
-        max_fix_rounds=settings.OCR_MAX_FIX_ROUNDS,
+        llm=LlmServiceAdapter(),
+        sandbox=PrecheckSandbox(),
         low_confidence_threshold=settings.OCR_LOW_CONFIDENCE,
         review_confidence_threshold=settings.OCR_REVIEW_CONFIDENCE,
     )

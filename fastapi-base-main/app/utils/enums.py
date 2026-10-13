@@ -19,7 +19,6 @@ class OcrStatus(str, enum.Enum):
     OCR_RUNNING = "OCR_RUNNING"
     LLM_CORRECTING = "LLM_CORRECTING"
     SANDBOX_CHECKING = "SANDBOX_CHECKING"
-    LLM_FIXING = "LLM_FIXING"
     DONE = "DONE"
     NEED_REVIEW = "NEED_REVIEW"
     FAILED = "FAILED"
@@ -29,9 +28,7 @@ class CodeStage(str, enum.Enum):
     OCR_RAW = "OCR_RAW"
     SERVICE_NORMALIZED = "SERVICE_NORMALIZED"
     LLM_CORRECTED = "LLM_CORRECTED"
-    LLM_FIX = "LLM_FIX"
 
 
 class LlmPurpose(str, enum.Enum):
     TRANSCRIBE = "TRANSCRIBE"
-    FIX_SYNTAX = "FIX_SYNTAX"

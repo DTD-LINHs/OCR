@@ -1,8 +1,8 @@
 """Data passed between the OCR pipeline stages (Paddle -> service -> LLM -> sandbox)."""
 
-from typing import Literal, Optional
+from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class OcrBox(BaseModel):
@@ -64,20 +64,8 @@ class LlmTranscription(BaseModel):
     code: str
     corrections: list[Correction] = []
     uncertain_lines: list[int] = []
-    confidence: float = Field(default=0.5, ge=0, le=1)
-
-
-class SyntaxDecision(BaseModel):
-    line: Optional[int] = None
-    message: str = ""
-    cause: Literal["ocr", "author", "unsure"]
-    fix: Optional[str] = None
-
-
-class LlmSyntaxFix(BaseModel):
-    code: str
-    decisions: list[SyntaxDecision] = []
-    corrections: list[Correction] = []
+    needs_review: bool = False
+    review_reasons: list[str] = []
 
 
 class SyntaxIssue(BaseModel):
@@ -115,6 +103,6 @@ class PipelineResult(BaseModel):
     syntax_ok: Optional[bool] = None
     syntax_errors: list[SyntaxIssue] = []
     uncertain_lines: list[int] = []
-    confidence: float
+    confidence: Optional[float] = None
     need_review: bool
     review_reasons: list[str] = []

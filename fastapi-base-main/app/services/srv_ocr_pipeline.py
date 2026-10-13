@@ -1,4 +1,4 @@
-"""Orchestrates Paddle OCR -> layout/normalize -> GPT-4o transcription -> sandbox syntax loop.
+"""Orchestrates Paddle OCR -> layout/normalize -> LLM correction -> sandbox syntax check.
 
 The pipeline knows nothing about the database: every intermediate artefact is
 reported to a `PipelineRecorder`, so it can be persisted (see srv_ocr_submission)
@@ -13,16 +13,14 @@ from app.schemas.sche_ocr_pipeline import (
     Correction,
     LayoutResult,
     LlmCallRecord,
-    LlmSyntaxFix,
     LlmTranscription,
     OcrBox,
     PipelineResult,
     SandboxResult,
-    SyntaxIssue,
 )
 from app.services.srv_layout import build_layout
 from app.services.srv_normalize import normalize_layout
-from app.services.srv_sandbox import SandboxUnavailable, canonical_language
+from app.services.srv_ocr_adapters import canonical_language
 from app.utils.enums import CodeStage, OcrStatus
 
 logger = logging.getLogger(__name__)
@@ -40,10 +38,6 @@ class OcrEngine(Protocol):
 
 class CodeLlm(Protocol):
     def transcribe(self, image_jpeg: bytes, draft: LayoutResult, log: CallLogger) -> LlmTranscription: ...
-
-    def fix_syntax(
-        self, image_jpeg: bytes, code: str, language: str, errors: list[SyntaxIssue], log: CallLogger
-    ) -> LlmSyntaxFix: ...
 
 
 class Sandbox(Protocol):
@@ -75,6 +69,10 @@ class PipelineError(Exception):
     pass
 
 
+class SandboxUnavailable(Exception):
+    """The sandbox itself failed, not the checked code."""
+
+
 def _default_llm_image(image: bytes) -> bytes:
     from app.utils.image import to_llm_jpeg
 
@@ -87,7 +85,6 @@ class OcrPipeline:
         ocr: OcrEngine,
         llm: CodeLlm,
         sandbox: Sandbox,
-        max_fix_rounds: int = 2,
         low_confidence_threshold: float = 0.8,
         review_confidence_threshold: float = 0.75,
         llm_image_fn: Callable[[bytes], bytes] = _default_llm_image,
@@ -95,7 +92,6 @@ class OcrPipeline:
         self.ocr = ocr
         self.llm = llm
         self.sandbox = sandbox
-        self.max_fix_rounds = max_fix_rounds
         self.low_confidence_threshold = low_confidence_threshold
         self.review_confidence_threshold = review_confidence_threshold
         self.llm_image_fn = llm_image_fn
@@ -114,7 +110,7 @@ class OcrPipeline:
         draft, normalize_fixes = normalize_layout(raw_layout)
         recorder.on_code_version(CodeStage.SERVICE_NORMALIZED, draft.render(), normalize_fixes)
 
-        # 3. GPT-4o reads the photo and corrects OCR misreads only
+        # 3. The LLM reads the photo and corrects OCR misreads only
         recorder.on_status(OcrStatus.LLM_CORRECTING)
         llm_image = self.llm_image_fn(image)
         transcription = self.llm.transcribe(llm_image, draft, log=recorder.on_llm_call)
@@ -125,20 +121,20 @@ class OcrPipeline:
             CodeStage.LLM_CORRECTED, code, transcription.corrections, language=language
         )
 
-        # 4. Syntax check in the sandbox; let the LLM decide whether errors are OCR or author mistakes
+        # 4. Syntax check in the sandbox. Remaining errors may be the author's, so they are only flagged.
         check: Optional[SandboxResult] = None
         sandbox_unavailable = False
         if self.sandbox.supports(language):
             try:
-                check, code, version_id, unsure = self._syntax_loop(
-                    llm_image, code, language, version_id, recorder
-                )
-                uncertain |= unsure
+                recorder.on_status(OcrStatus.SANDBOX_CHECKING)
+                check = self.sandbox.check(code, language)
+                recorder.on_sandbox_check(version_id, check)
             except SandboxUnavailable as e:
                 logger.error("Sandbox unavailable: %s", e)
                 sandbox_unavailable = True
 
-        # 5. Decide whether a human must review
+        # 5. Decide whether a human must review. Pipeline reasons are codes; the LLM's are prefixed text.
+        confidence = sum(box.confidence for box in boxes) / len(boxes)
         reasons = []
         if check is None:
             reasons.append("sandbox_unavailable" if sandbox_unavailable else "language_not_checked")
@@ -146,11 +142,14 @@ class OcrPipeline:
             reasons.append("syntax_errors")
         if uncertain:
             reasons.append("uncertain_lines")
-        if transcription.confidence < self.review_confidence_threshold:
+        if confidence < self.review_confidence_threshold:
             reasons.append("low_confidence")
         similarity = difflib.SequenceMatcher(None, draft.render(), code, autojunk=False).ratio()
         if similarity < MIN_DRAFT_SIMILARITY:
             reasons.append("large_llm_changes")
+        reasons += [f"llm: {reason}" for reason in transcription.review_reasons]
+        if transcription.needs_review and not transcription.review_reasons:
+            reasons.append("llm: needs_review")
 
         return PipelineResult(
             language=language,
@@ -158,37 +157,7 @@ class OcrPipeline:
             syntax_ok=check.ok if check else None,
             syntax_errors=check.errors if check else [],
             uncertain_lines=sorted(uncertain),
-            confidence=transcription.confidence,
+            confidence=confidence,
             need_review=bool(reasons),
             review_reasons=reasons,
         )
-
-    def _syntax_loop(
-        self,
-        llm_image: bytes,
-        code: str,
-        language: str,
-        version_id: Optional[int],
-        recorder: PipelineRecorder,
-    ) -> tuple[SandboxResult, str, Optional[int], set[int]]:
-        unsure: set[int] = set()
-        fix_round = 0
-        while True:
-            recorder.on_status(OcrStatus.SANDBOX_CHECKING)
-            check = self.sandbox.check(code, language)
-            recorder.on_sandbox_check(version_id, check)
-            if check.ok or check.timed_out or fix_round >= self.max_fix_rounds:
-                return check, code, version_id, unsure
-
-            fix_round += 1
-            recorder.on_status(OcrStatus.LLM_FIXING)
-            fix = self.llm.fix_syntax(llm_image, code, language, check.errors, log=recorder.on_llm_call)
-            unsure |= {d.line for d in fix.decisions if d.cause == "unsure" and d.line}
-            if fix.code.strip() == code.strip():
-                # LLM attributes every remaining error to the author (or cannot tell): keep as written.
-                return check, code, version_id, unsure
-
-            code = fix.code
-            version_id = recorder.on_code_version(
-                CodeStage.LLM_FIX, code, fix.corrections, language=language, fix_round=fix_round
-            )

@@ -37,15 +37,8 @@ class Settings(BaseSettings):
     OCR_DET_MODEL: Optional[str] = os.environ.get("OCR_DET_MODEL") or None
     OCR_REC_MODEL: Optional[str] = os.environ.get("OCR_REC_MODEL") or None
     OCR_LOW_CONFIDENCE: float = float(os.environ.get("OCR_LOW_CONFIDENCE", "0.8"))
+    # Mean PaddleOCR box confidence below this -> "low_confidence" review reason
     OCR_REVIEW_CONFIDENCE: float = float(os.environ.get("OCR_REVIEW_CONFIDENCE", "0.75"))
-    OCR_MAX_FIX_ROUNDS: int = int(os.environ.get("OCR_MAX_FIX_ROUNDS", "2"))
-    OPENAI_API_KEY: Optional[str] = os.environ.get("OPENAI_API_KEY") or None
-    OPENAI_MODEL: str = os.environ.get("OPENAI_MODEL", "gpt-4o")
-    OPENAI_TIMEOUT: int = int(os.environ.get("OPENAI_TIMEOUT", "120"))
-    SANDBOX_TIMEOUT: int = int(os.environ.get("SANDBOX_TIMEOUT", "15"))
-    SANDBOX_MEMORY: str = os.environ.get("SANDBOX_MEMORY", "256m")
-    SANDBOX_CPUS: float = float(os.environ.get("SANDBOX_CPUS", "0.5"))
-    SANDBOX_RUNTIME: Optional[str] = os.environ.get("SANDBOX_RUNTIME") or None
 
     # ---- LLM (sửa lỗi OCR + nhận xét bài) ----
     # LLM_PROVIDER=mock      : không gọi LLM thật, dùng để dev/test khi chưa có API key
