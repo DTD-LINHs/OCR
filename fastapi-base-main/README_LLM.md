@@ -48,6 +48,8 @@ LLM_TEMPERATURE=0                        # 0 = ổn định, lần nào chạy c
 LLM_TIMEOUT_SECONDS=180
 LLM_JSON_MODE=true                       # server nào không hỗ trợ thì code tự thử lại không dùng
 LLM_MIN_SIMILARITY=0.7                   # ngưỡng phát hiện LLM "viết lại" code
+LLM_MIN_LINE_SIMILARITY=0.5              # từng dòng: giống bản OCR dưới ngưỡng này -> dòng bị sửa quá nhiều
+LLM_GUARD_MODE=flag                      # flag: chỉ đánh dấu thay đổi đáng ngờ | revert: đặt lại bản OCR gốc
 ```
 
 - **`mock`**: không gọi LLM thật. `/correct-ocr` chỉ áp 2 luật đơn giản (`a-b` → `a_b`, từ khóa viết hoa → chữ thường), `/review` chấm theo tỷ lệ test đạt. Dùng để **bạn OCR, bạn sandbox và frontend tích hợp ngay**, không cần API key.
@@ -126,6 +128,9 @@ Model phải hỗ trợ đầu vào ảnh (trên OpenRouter: mục *Modalities* 
   "similarity": 0.91,
   "needs_review": true,
   "review_reasons": ["Có 1 chỗ LLM không chắc là lỗi OCR hay lỗi của sinh viên"],
+  "suspicious_changes": [{"line": 3, "kind": "operator", "ocr_token": "/", "llm_token": "%",
+                          "ocr_line": "if n / 2 == 0:", "llm_line": "if n % 2 == 0:", "reverted": false}],
+  "reverted_changes": [],
   "used_image": false,
   "model": "qwen2.5-coder:7b"
 }
@@ -137,6 +142,8 @@ Model phải hỗ trợ đầu vào ảnh (trên OpenRouter: mục *Modalities* 
 | `changes` | Highlight các dòng LLM đã sửa (`before` → `after`), tô màu theo `confidence` |
 | `uncertain` | Đánh dấu chỗ cần giảng viên đối chiếu với ảnh |
 | `needs_review` + `review_reasons` | Hiện cảnh báo "Cần kiểm tra" |
+| `suspicious_changes` | Thay đổi của LLM mà server nghi là sửa logic chứ không phải sửa OCR. Chế độ `flag` (mặc định): `code` vẫn giữ thay đổi của LLM, highlight để giảng viên đối chiếu ảnh |
+| `reverted_changes` | Chỉ có khi `LLM_GUARD_MODE=revert`: phần trong `suspicious_changes` server đã hoàn tác (`code` đang giữ token OCR gốc) |
 | `syntax_ok` / `syntax_error` | Biết trước code có chạy được không, trước khi gửi sandbox |
 
 ### 4.2. `POST /api/v1/llm/review`
@@ -211,6 +218,35 @@ Model phải hỗ trợ đầu vào ảnh (trên OpenRouter: mục *Modalities* 
 1. Dựng prompt (`llm_prompts.py`): quy tắc + **1 ví dụ mẫu** + output OCR có đánh số dòng và score.
 2. Gọi LLM, đọc JSON. Nếu LLM bọc JSON trong ```` ```json ```` hay có chữ thừa, `extract_json()` vẫn lấy ra được.
 3. **Kiểm tra an toàn**, phần quan trọng nhất. Hệ thống dùng để chấm điểm, nên LLM tuyệt đối không được sửa lỗi của sinh viên:
+   - **Server phát hiện thay đổi đáng ngờ** (làm trước mọi kiểm tra khác), xử lý theo `LLM_GUARD_MODE`:
+     - `flag` (**mặc định**): **giữ nguyên code của LLM**, chỉ ghi vào `suspicious_changes`, `uncertain`
+       (*"server nghi ngờ: ..."*) và `review_reasons`. Giảng viên đối chiếu ảnh rồi quyết định.
+     - `revert`: đặt lại token / nguyên dòng OCR gốc cho chỗ đáng ngờ; ghi thêm vào `reverted_changes`.
+       Đo ở bước D (12 ảnh), chế độ này hoàn tác nhầm khá nhiều sửa OCR đúng nên **không dùng mặc định**.
+
+     Bước 1, theo token: ghép từng dòng OCR với dòng LLM, so theo token. Khi LLM thay **1 token bằng 1 token khác**
+     thuộc một trong các loại sau thì tính là đáng ngờ:
+     - đổi giữa hai toán tử hợp lệ: `/ % < <= > >= = == + - and or`;
+     - đổi một số thành số khác;
+     - đổi một tên (identifier) thành tên khác hẳn: độ giống nhau `difflib` (không phân biệt hoa/thường) < 0.5.
+
+     **Không** tính là đáng ngờ (sửa OCR thật, rút ra từ bước D):
+     - tên lạ thành từ khóa Python (`Son` → `for`);
+     - đổi tên cho thống nhất: tên OCR chỉ xuất hiện 1 lần, còn tên mới được dùng ở ít nhất 2 chỗ trong code LLM
+       (`cum` → `nam`, `se` → `x`). Đổi tên một biến ở mọi chỗ (`count` → `total`) thì vẫn bị tính;
+     - nhầm ký tự trong số (`O->0`, `l->1`, `I->1`, `S->5`) và dấu `.` thừa cuối số (`0.` → `0`);
+     - `=` → `==` trong điều kiện `if`/`elif`/`while` (ở đó `=` là lỗi cú pháp);
+     - `-` → `=` ở phép gán đầu câu lệnh (`ask -input(...)` → `ask = input(...)`);
+     - tách/gộp token như `"21"` → `"> 1"`, `Cviput (` → `(input(` (server không xét thay đổi làm đổi số lượng token).
+
+     Bước 2, theo dòng: dòng nào LLM sửa mà giống dòng OCR dưới `LLM_MIN_LINE_SIMILARITY` (mặc định **0.5**, so sau
+     khi bỏ khoảng trắng và đưa về chữ thường) thì không giống sửa ký tự OCR nữa: tính là đáng ngờ (`kind: "line"`;
+     chế độ `revert` thì trả lại nguyên dòng OCR, cả thụt lề). Đo trên output PaddleOCR của 51 ảnh dataset so với
+     ground truth: ở 0.5 có 2% dòng sửa đúng bị tính nhầm (0.6: 4%, 0.7: 9%), chủ yếu là dòng OCR đọc nát hẳn.
+     Lớp này **không** bắt được sửa logic nhỏ như `range(i, ...)` → `range(i + 1, ...)` (dòng vẫn giống ~95%)
+     hay đổi thụt lề (bỏ khoảng trắng thì 2 dòng như nhau).
+   - Cảnh báo "LLM có thể đã viết lại code" tính trên code **LLM trả về**; còn trường `similarity` tính trên code
+     cuối cùng (ở chế độ `revert` là code sau khi hoàn tác).
    - `similarity`: so code sau khi sửa với bản OCR, bỏ qua khoảng trắng và hoa/thường. Nếu dưới `LLM_MIN_SIMILARITY` thì LLM có thể đã viết lại code, nên bật `needs_review`.
    - Số dòng tăng lên: LLM có thể đã thêm code.
    - Có thay đổi `confidence: low` hoặc có `uncertain`: cần người xem.
@@ -259,6 +295,14 @@ Model phải hỗ trợ đầu vào ảnh (trên OpenRouter: mục *Modalities* 
   do lộ test ẩn: đã thử bỏ cả tên test ẩn lẫn ràng buộc `0 <= n <= 20` khỏi đề bài, model vẫn nhắc `n = 0`.
   Nhóm chọn giữ nguyên prompt (dặn chặt hơn sẽ làm nhận xét kém hữu ích); **nhận xét cần được giảng viên duyệt
   trước khi gửi sinh viên.**
+- **Bộ phát hiện thay đổi đáng ngờ chỉ bắt được thay 1 token bằng 1 token, hoặc dòng bị sửa quá nhiều.**
+  Thay đổi làm đổi số lượng token mà dòng vẫn rất giống (vd. `i < n` thành `i <= n - 1`, thêm cả một dòng)
+  không bị phát hiện. Những trường hợp này dựa vào prompt và các kiểm tra `similarity` / số dòng; giảng viên vẫn cần
+  xem `changes`.
+- **Chưa có luật riêng cho off-by-one.** Thêm/bớt `+ 1` / `- 1` (vd. `range(i, len(nums))` → `range(i + 1, len(nums))`)
+  không bị phát hiện ở cả 2 lớp. Ở bước D (ảnh 50) LLM không đụng tới chỗ này; nếu cần chặn cứng thì phải thêm luật
+  ở mức token riêng cho việc chèn/xóa `+ 1` / `- 1`.
+- **Đổi thụt lề không bị phát hiện** (vd. đưa `max = 0` ra khỏi vòng `for` ở ảnh 45, `final_list = []` ở ảnh 51).
 - **Thời gian phản hồi phụ thuộc nhà cung cấp mà OpenRouter định tuyến tới.** Đo với `deepseek/deepseek-v4.1-flash`:
   thường 5.5–17 giây mỗi request, có lần 83 giây (request `/review`, không có ảnh). Vì vậy timeout mặc định là 180 giây.
 
