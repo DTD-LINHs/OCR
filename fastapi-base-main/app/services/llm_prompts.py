@@ -35,6 +35,17 @@ DO NOT FIX (student errors, keep them exactly):
 - Missing or extra statements. Never add new lines of code, never complete unfinished code.
 - Indentation that is consistent but semantically wrong.
 - Spelling of identifiers the student chose (even if unusual), as long as it is consistent.
+- Do NOT change a token that is already valid Python and plausible as written (identifiers, keywords,
+  numbers, operators). Only change a token if it is clearly a garbled misreading (e.g. "retusn", "Cviput").
+- Never swap one valid operator for another: / vs %, < vs <=, > vs >=, = vs ==, + vs -, and vs or, is vs ==.
+  These are student choices.
+- Never change numeric values, except obvious character confusions inside a number (O->0, l->1, S->5).
+- Never rename an identifier to a "nicer" or "more correct" name. Only fix an identifier if the same
+  identifier appears correctly elsewhere in the code (or in the photo).
+- Never add or remove lines (the only exception is removing pure OCR-noise lines, as described under FIX),
+  never add def/return/import/else or any new statement.
+- Keep string literal contents as written, except obvious character misreadings.
+- If a change is not clearly an OCR misreading, DO NOT make it: keep the text and list it in "uncertain".
 
 AMBIGUOUS CASES:
 - Punctuation that OCR often drops (":" at the end of if/for/while/def, closing ")" or quote) MAY be restored,
@@ -61,12 +72,13 @@ OCR output (line number | OCR score | text):
 2 | 0.71 | if n / 2 == O
 3 | 0.88 |         retunn True
 4 | 0.95 |     return False
+5 | 0.92 | print(is_even(7))
 """
 
 CORRECT_OCR_EXAMPLE_ASSISTANT = """\
-{"code": "def is_even(n):\\n    if n / 2 == 0:\\n        return True\\n    return False",
+{"code": "def is_even(n):\\n    if n / 2 == 0:\\n        return True\\n    return False\\nprint(is_even(7))",
  "changes": [
-  {"line": 1, "before": "def is_evem(n):", "after": "def is_even(n):", "reason": "OCR nhầm m/n", "confidence": "medium"},
+  {"line": 1, "before": "def is_evem(n):", "after": "def is_even(n):", "reason": "OCR nhầm m/n; tên is_even xuất hiện đúng ở dòng 5", "confidence": "high"},
   {"line": 2, "before": "if n / 2 == O", "after": "    if n / 2 == 0:", "reason": "OCR nhầm 0/O, mất thụt lề và dấu ':'", "confidence": "low"},
   {"line": 3, "before": "        retunn True", "after": "        return True", "reason": "OCR nhầm n/r trong từ khóa return", "confidence": "high"}
  ],

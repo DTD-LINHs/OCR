@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     LLM_JSON_MODE: bool = os.environ.get("LLM_JSON_MODE", "true").lower() == "true"
     # Nếu code sau khi sửa giống bản OCR dưới ngưỡng này -> đánh dấu cần giảng viên xem
     LLM_MIN_SIMILARITY: float = float(os.environ.get("LLM_MIN_SIMILARITY", "0.7"))
+    # Từng dòng: dòng LLM sửa giống dòng OCR dưới ngưỡng này (bỏ khoảng trắng, chữ thường) -> coi là sửa quá nhiều
+    LLM_MIN_LINE_SIMILARITY: float = float(os.environ.get("LLM_MIN_LINE_SIMILARITY", "0.5"))
+    # Xử lý thay đổi đáng ngờ của LLM ở /correct-ocr:
+    #   flag   : giữ nguyên code LLM, chỉ đánh dấu (suspicious_changes, uncertain, review_reasons)
+    #   revert : đặt lại token / dòng OCR gốc cho các thay đổi đáng ngờ
+    LLM_GUARD_MODE: str = os.environ.get("LLM_GUARD_MODE", "flag").lower()
 
     @model_validator(mode="after")
     def _llm_key_fallback(self):

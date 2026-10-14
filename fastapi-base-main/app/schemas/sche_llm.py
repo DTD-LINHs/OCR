@@ -48,6 +48,22 @@ class UncertainSpot(BaseModel):
     note: str = Field(..., description="Vì sao không chắc: lỗi OCR hay lỗi của sinh viên")
 
 
+class SuspiciousChange(BaseModel):
+    """Một thay đổi của LLM mà server nghi là thay đổi logic, không phải sửa lỗi OCR."""
+
+    line: int = Field(..., description="Số dòng trong code đã sửa (bắt đầu từ 1)")
+    kind: Literal["operator", "number", "identifier", "line"] = Field(
+        ..., description="line: cả dòng bị sửa quá nhiều (không giống sửa ký tự OCR)")
+    ocr_token: str = Field(..., description="Token trong bản OCR (kind=line: cả dòng OCR)")
+    llm_token: str = Field(..., description="Token LLM đổi thành (kind=line: cả dòng LLM)")
+    ocr_line: str = Field(..., description="Dòng OCR gốc")
+    llm_line: str = Field(..., description="Dòng LLM trả về")
+    reverted: bool = Field(False, description="True nếu server đã hoàn tác (LLM_GUARD_MODE=revert)")
+
+
+RevertedChange = SuspiciousChange   # tên cũ, giữ để tương thích
+
+
 class CorrectOcrResponse(BaseModel):
     code: str = Field(..., description="Code sau khi sửa lỗi nhận dạng")
     changes: List[CodeChange] = []
@@ -59,6 +75,12 @@ class CorrectOcrResponse(BaseModel):
     similarity: float = Field(..., description="Độ giống nhau giữa OCR và code đã sửa (0..1)")
     needs_review: bool = Field(..., description="True nếu LLM sửa quá nhiều -> giảng viên nên kiểm tra")
     review_reasons: List[str] = []
+    suspicious_changes: List[SuspiciousChange] = Field(
+        [], description="Thay đổi đáng ngờ của LLM mà server phát hiện (cả 2 chế độ LLM_GUARD_MODE)"
+    )
+    reverted_changes: List[SuspiciousChange] = Field(
+        [], description="Phần trong suspicious_changes đã bị server hoàn tác (chỉ khi LLM_GUARD_MODE=revert)"
+    )
     used_image: bool = Field(False, description="Có gửi ảnh gốc cho LLM đối chiếu không")
     model: str
 

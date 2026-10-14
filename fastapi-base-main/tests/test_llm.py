@@ -120,12 +120,21 @@ def test_correct_ocr_good_fix(monkeypatch):
 
 def test_correct_ocr_flags_rewrite(monkeypatch):
     """LLM viết lại cả bài -> phải bị đánh dấu needs_review."""
+    monkeypatch.setattr(settings, "LLM_GUARD_MODE", "revert")
     rewritten = "import math\n\ndef factorial(n):\n    return math.factorial(n)\n\nprint(factorial(int(input())))"
     fake_llm(monkeypatch, {"code": rewritten, "changes": [], "uncertain": []})
     res = service().correct_ocr(CorrectOcrRequest(ocr_text=OCR_IMG0))
     assert res.needs_review is True
     assert any("viết lại" in r for r in res.review_reasons)
-    assert res.changes, "khi LLM không liệt kê thay đổi, service phải tự tính diff"
+    # lớp chặn theo dòng trả lại nguyên các dòng OCR -> code cuối không còn bài viết lại
+    assert res.code == OCR_IMG0
+    assert res.reverted_changes and all(r.kind == "line" for r in res.reverted_changes)
+
+
+def test_correct_ocr_auto_diff_when_llm_lists_no_changes(monkeypatch):
+    fake_llm(monkeypatch, {"code": "x = 1\nreturn x", "changes": [], "uncertain": []})
+    res = service().correct_ocr(CorrectOcrRequest(ocr_text="x = 1\nretusn x"))
+    assert [(c.line, c.before, c.after) for c in res.changes] == [(2, "retusn x", "return x")]
 
 
 def test_correct_ocr_retries_without_json_mode(monkeypatch):
@@ -390,3 +399,159 @@ def test_service_passes_syntax_error_to_prompt(monkeypatch):
     no_img, with_img = seen[0]["messages"][-1]["content"], seen[1]["messages"][-1]["content"][0]["text"]
     assert "reported: Dòng 3: invalid syntax." in no_img and "character-level" in no_img
     assert "reported: Dòng 3: invalid syntax." in with_img and "the photo shows" in with_img
+
+
+# ---------------------------------------------------------------- server hoàn tác thay đổi đáng ngờ của LLM
+def _correct(monkeypatch, ocr: str, llm_code: str, changes: list | None = None, mode: str = "revert"):
+    monkeypatch.setattr(settings, "LLM_GUARD_MODE", mode)
+    fake_llm(monkeypatch, {"code": llm_code, "changes": changes or [], "uncertain": []})
+    return service().correct_ocr(CorrectOcrRequest(ocr_text=ocr))
+
+
+def _assert_reverted(res, kind: str, ocr_tok: str, llm_tok: str, line: int):
+    assert [(r.kind, r.ocr_token, r.llm_token, r.line) for r in res.reverted_changes] == [(kind, ocr_tok, llm_tok, line)]
+    assert any(u.line == line and u.text == ocr_tok and "server hoàn tác" in u.note for u in res.uncertain)
+    assert any("hoàn tác" in r for r in res.review_reasons) and res.needs_review
+
+
+def test_revert_operator_swap(monkeypatch):
+    res = _correct(monkeypatch, "def is_even(n):\n    if n / 2 == O:\n        retunn True",
+                   "def is_even(n):\n    if n % 2 == 0:\n        return True",
+                   [{"line": 2, "before": "    if n / 2 == O:", "after": "    if n % 2 == 0:", "reason": "x"}])
+    _assert_reverted(res, "operator", "/", "%", 2)
+    assert res.code == "def is_even(n):\n    if n / 2 == 0:\n        return True"   # O->0 và retunn vẫn được sửa
+    assert [c.after for c in res.changes if c.line == 2] == ["    if n / 2 == 0:"]   # "after" theo dòng đã hoàn tác
+
+
+def test_revert_number_change(monkeypatch):
+    res = _correct(monkeypatch, "total = 0\nfor x in nums:\n    total *= x",
+                   "total = 1\nfor x in nums:\n    total *= x",
+                   [{"line": 1, "before": "total = 0", "after": "total = 1", "reason": "x"}])
+    _assert_reverted(res, "number", "0", "1", 1)
+    assert res.code.startswith("total = 0\n")
+    assert res.changes == []          # thay đổi duy nhất bị hoàn tác -> không còn trong changes
+
+
+def test_revert_identifier_rename(monkeypatch):
+    res = _correct(monkeypatch, "x = a + b\nprint(x)", "result = a + b\nprint(x)")
+    _assert_reverted(res, "identifier", "x", "result", 1)
+    assert res.code == "x = a + b\nprint(x)"
+
+
+def test_genuine_ocr_fixes_are_kept(monkeypatch):
+    fixed = ('num = int(input("Enter a number: "))\nAns = 1\nwhile num > 1:\n'
+             '    Ans *= num\n    num -= 1\nreturn Ans')
+    res = _correct(monkeypatch, OCR_IMG0, fixed)
+    assert res.reverted_changes == []
+    assert res.code == fixed          # retusn->return, Cviput->input, mum->num, "21"->"> 1" đều giữ
+    assert not any("hoàn tác" in r for r in res.review_reasons)
+
+
+def test_suspicious_kind_rules():
+    sk = srv_llm.suspicious_kind
+    assert sk("retusn", "return") is None and sk("Cviput", "input") is None and sk("mum", "num") is None
+    assert sk("DEF", "def") is None                      # chỉ đổi hoa/thường
+    assert sk("1O", "10") is None and sk("l5", "15") is None and sk("S", "5") is None
+    assert sk("=", "==") == "operator" and sk("and", "or") == "operator"
+    assert sk("2", "3") == "number" and sk("count", "total") == "identifier"
+
+
+# ---------------------------------------------------------------- chặn theo dòng: dòng bị sửa quá nhiều
+def test_line_rewrite_is_reverted(monkeypatch):
+    ocr = "def f(nums):\n    for x in nums:\n        print(x)"
+    res = _correct(monkeypatch, ocr, "def f(nums):\n    for idx, value in enumerate(sorted(nums)):\n        print(x)")
+    assert res.code == ocr                                       # trả lại nguyên dòng OCR
+    assert [(r.kind, r.line) for r in res.reverted_changes] == [("line", 2)]
+    assert any(u.line == 2 and "dòng bị sửa quá nhiều" in u.note for u in res.uncertain)
+    assert any("nguyên dòng OCR" in r for r in res.review_reasons)
+
+
+def test_line_layer_keeps_genuine_ocr_fixes(monkeypatch):
+    ocr = 'num = int Cviput ("Enter a number ")\nAns = 1\nretusn Ans'
+    fixed = 'num = int(input("Enter a number "))\nAns = 1\nreturn Ans'
+    res = _correct(monkeypatch, ocr, fixed)
+    assert res.code == fixed and res.reverted_changes == []
+
+
+def test_line_threshold_from_config(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_MIN_LINE_SIMILARITY", 0.95)   # ngưỡng rất cao -> retusn->return cũng bị trả lại
+    res = _correct(monkeypatch, "retusn Ans", "return Ans")
+    assert res.code == "retusn Ans" and res.reverted_changes[0].kind == "line"
+
+
+def test_line_layer_does_not_catch_small_logic_edit(monkeypatch):
+    """Giới hạn đã biết: thêm "+ 1" chỉ đổi 2 ký tự nên dòng vẫn giống OCR ~95%, lớp chặn theo dòng không bắt được
+    (và lớp token cũng không, vì số token thay đổi). Nếu sau này thêm luật riêng cho off-by-one thì sửa test này."""
+    ocr = "for i in range(len(nums)):\n    for j in range(i, len(nums)):\n        pass"
+    llm = "for i in range(len(nums)):\n    for j in range(i + 1, len(nums)):\n        pass"
+    assert srv_llm._line_ratio("    for j in range(i, len(nums)):", "    for j in range(i + 1, len(nums)):") > 0.9
+    res = _correct(monkeypatch, ocr, llm)
+    assert res.reverted_changes == [] and "range(i + 1" in res.code
+
+
+# ---------------------------------------------------------------- LLM_GUARD_MODE=flag (mặc định)
+def test_guard_mode_default_is_flag(monkeypatch):
+    from app.core import config
+    monkeypatch.delenv("LLM_GUARD_MODE", raising=False)
+    assert config.Settings().LLM_GUARD_MODE == "flag"
+    assert config.Settings().LLM_MIN_LINE_SIMILARITY == 0.5
+
+
+def test_flag_mode_keeps_llm_code_and_marks_suspicious(monkeypatch):
+    ocr = "def is_even(n):\n    if n / 2 == O:\n        retunn True"
+    llm = "def is_even(n):\n    if n % 2 == 0:\n        return True"
+    res = _correct(monkeypatch, ocr, llm, mode="flag")
+    assert res.code == llm                                   # không đổi code của LLM
+    assert res.reverted_changes == []
+    assert [(s.kind, s.ocr_token, s.llm_token, s.line, s.reverted) for s in res.suspicious_changes] == \
+        [("operator", "/", "%", 2, False)]
+    assert any(u.line == 2 and u.text == "%" and "server nghi ngờ" in u.note for u in res.uncertain)
+    assert any("nghi ngờ" in r for r in res.review_reasons) and res.needs_review
+
+
+def test_flag_mode_marks_heavy_line_without_changing_it(monkeypatch):
+    ocr = "def f(nums):\n    for x in nums:\n        print(x)"
+    llm = "def f(nums):\n    for idx, value in enumerate(sorted(nums)):\n        print(x)"
+    res = _correct(monkeypatch, ocr, llm, mode="flag")
+    assert res.code == llm and res.reverted_changes == []
+    assert [(s.kind, s.line) for s in res.suspicious_changes] == [("line", 2)]
+    assert any("dòng bị sửa quá nhiều" in u.note for u in res.uncertain)
+
+
+def test_revert_mode_marks_entries_as_reverted(monkeypatch):
+    res = _correct(monkeypatch, "total = 0", "total = 1", mode="revert")
+    assert res.code == "total = 0"
+    assert res.suspicious_changes == res.reverted_changes and res.reverted_changes[0].reverted is True
+
+
+# ---------------------------------------------------------------- ngoại lệ: các sửa OCR thật ở bước D không bị tính
+def _sus(ocr: str, llm: str):
+    _, found = srv_llm.guard_llm_code(ocr, llm, "flag", 0.5)
+    return [(s.kind, s.ocr_token, s.llm_token) for s in found]
+
+
+def test_keyword_restored_is_not_suspicious():                      # ảnh 50: "Son" -> "for"
+    assert _sus("Son i in pange (len(nams)) :", "for i in range(len(nams)) :") == []
+
+
+def test_consistent_rename_is_not_suspicious():
+    assert _sus("for nam in dup:\n    out.append(cum)", "for nam in dup:\n    out.append(nam)") == []      # ảnh 51
+    assert _sus("for xe in ns:\n    total*=se", "for x in ns:\n    total *= x") == []                    # ảnh 54
+    # đổi tên một biến ở mọi chỗ (tên OCR xuất hiện nhiều lần) vẫn bị tính
+    assert _sus("count = 0\ncount += 1", "total = 0\ntotal += 1") == [("identifier", "count", "total")] * 2
+
+
+def test_trailing_dot_in_number_is_noise():                          # ảnh 45: "0." -> "0"
+    assert _sus("    max= 0.", "    max = 0") == []
+    assert _sus("    max= 0.", "    max = 1") == [("number", "0.", "1")]
+
+
+def test_assignment_and_condition_operator_fixes():
+    assert _sus("if(nam[P]= fanget):", "if(nam[P] == fanget):") == []                       # ảnh 50
+    assert _sus("        ask -input (\"Yes/No: \")", "        ask = input(\"Yes/No: \")") == []   # ảnh 29
+    assert _sus("x = 1", "x == 1") == [("operator", "=", "==")]          # ngoài điều kiện: vẫn tính
+    assert _sus("y = a - b", "y = a = b") == [("operator", "-", "=")]    # không phải phép gán đầu câu: vẫn tính
+
+
+def test_line_threshold_half_keeps_garbled_def_line():               # ảnh 53, ratio 0.591
+    assert _sus("do upon-lowercont:", "def upper_lower_count(stro):") == []

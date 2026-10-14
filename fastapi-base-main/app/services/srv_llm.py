@@ -9,8 +9,10 @@ Khi LLM_PROVIDER=mock, không gọi LLM thật mà trả kết quả giả lập
 
 import difflib
 import json
+import keyword
 import logging
 import re
+from collections import Counter
 from typing import Any, Optional
 
 import httpx
@@ -27,6 +29,7 @@ from app.schemas.sche_llm import (
     ReviewIssue,
     ReviewRequest,
     ReviewResponse,
+    SuspiciousChange,
     UncertainSpot,
 )
 from app.services import llm_prompts as P
@@ -156,6 +159,157 @@ def line_diff(before: str, after: str) -> list[CodeChange]:
                 confidence="medium",
             ))
     return out
+
+
+# ---- Phát hiện thay đổi đáng ngờ: LLM có đổi logic của sinh viên không?
+# Token: số (bắt đầu bằng chữ số, gồm cả "1O" để bắt nhầm O/0) | tên | toán tử nhiều ký tự | 1 ký tự bất kỳ
+TOKEN_RE = re.compile(r"\d[\w.]*|[^\W\d]\w*|\*\*=|//=|==|!=|<=|>=|\+=|-=|\*=|/=|%=|//|\*\*|\S")
+# Đổi qua lại giữa các toán tử này là lựa chọn của sinh viên, không phải lỗi OCR
+SWAPPABLE_OPS = {"/", "%", "<", "<=", ">", ">=", "=", "==", "+", "-", "and", "or"}
+# Nhầm ký tự trong số mà OCR hay gặp (O->0, l->1, S->5) thì vẫn cho sửa
+NUMBER_CONFUSIONS = str.maketrans({"O": "0", "o": "0", "l": "1", "I": "1", "S": "5"})
+MIN_IDENT_RATIO = 0.5
+CONDITION_RE = re.compile(r"^\s*(if|elif|while)\b")
+ASSIGN_MINUS_RE = re.compile(r"^\s*[^\W\d]\w*\s*-(?!=)")   # "ask -input(...)": OCR đọc "=" thành "-"
+FLAG_NOTE = "server nghi ngờ: có thể là thay đổi logic, không phải lỗi OCR"
+FLAG_LINE_NOTE = "server nghi ngờ: dòng bị sửa quá nhiều"
+REVERT_NOTE = "server hoàn tác: có thể là thay đổi logic, không phải lỗi OCR"
+REVERT_LINE_NOTE = "server hoàn tác: dòng bị sửa quá nhiều"
+
+
+def _token_kind(tok: str) -> str:
+    if tok in SWAPPABLE_OPS:
+        return "operator"
+    if tok[0].isdigit():
+        return "number"
+    if tok[0].isalpha() or tok[0] == "_":
+        return "identifier"
+    return "other"
+
+
+def suspicious_kind(ocr_tok: str, llm_tok: str, ctx: Optional[dict] = None) -> Optional[str]:
+    """Thay 1 token bằng 1 token khác có phải thay đổi logic không? Trả về loại, hoặc None nếu là sửa OCR hợp lý.
+
+    ctx (không bắt buộc): ocr_line, pos (vị trí token trong dòng OCR), ocr_counts / llm_counts (số lần mỗi token
+    xuất hiện trong toàn bộ bản OCR / code LLM). Thiếu ctx thì chỉ áp các luật không cần ngữ cảnh.
+    """
+    if ocr_tok == llm_tok:
+        return None
+    ctx = ctx or {}
+    a, b = _token_kind(ocr_tok), _token_kind(llm_tok)
+    if a == b == "operator":
+        line = ctx.get("ocr_line", "")
+        if (ocr_tok, llm_tok) == ("=", "==") and CONDITION_RE.match(line):
+            return None   # "=" trong điều kiện if/elif/while là lỗi cú pháp: OCR mất một dấu "="
+        if (ocr_tok, llm_tok) == ("-", "=") and ctx.get("pos") == 1 and ASSIGN_MINUS_RE.match(line):
+            return None   # phép gán đầu câu lệnh: OCR đọc "=" thành "-"
+        return "operator"
+    if a == b == "number":
+        if llm_tok in (ocr_tok.translate(NUMBER_CONFUSIONS), ocr_tok.rstrip(".").translate(NUMBER_CONFUSIONS)):
+            return None   # nhầm ký tự trong số, hoặc dấu "." thừa cuối số (nhiễu OCR)
+        return "number"
+    if a == b == "identifier":
+        if keyword.iskeyword(llm_tok) and not keyword.iskeyword(ocr_tok):
+            return None   # tên lạ -> từ khóa Python (vd. "Son" -> "for"): OCR đọc sai từ khóa
+        # so chữ thường để không phạt việc khôi phục chữ thường (DEF -> def)
+        ratio = difflib.SequenceMatcher(None, ocr_tok.lower(), llm_tok.lower(), autojunk=False).ratio()
+        if ratio >= MIN_IDENT_RATIO:
+            return None
+        oc, lc = ctx.get("ocr_counts"), ctx.get("llm_counts")
+        if oc is not None and lc is not None and oc[ocr_tok] == 1 and lc[llm_tok] >= 2:
+            return None   # tên OCR chỉ xuất hiện 1 lần, đổi về tên LLM dùng thống nhất ở chỗ khác (vd. "cum" -> "nam")
+        return "identifier"
+    return None
+
+
+def _pair_lines(ocr_lines: list[str], new_lines: list[str]) -> list[tuple[int, int]]:
+    """Ghép dòng OCR với dòng đã sửa tương ứng: (chỉ số dòng OCR, chỉ số dòng mới)."""
+    sm = difflib.SequenceMatcher(None, [ln.strip() for ln in ocr_lines], [ln.strip() for ln in new_lines],
+                                 autojunk=False)
+    pairs = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "replace":
+            continue
+        if i2 - i1 == j2 - j1:
+            pairs += list(zip(range(i1, i2), range(j1, j2)))
+            continue
+        # Số dòng khác nhau (vd. LLM bỏ dòng nhiễu): ghép mỗi dòng mới với dòng OCR giống nhất
+        for j in range(j1, j2):
+            ratio, best = max((difflib.SequenceMatcher(None, ocr_lines[i].strip(), new_lines[j].strip(),
+                                                       autojunk=False).ratio(), i) for i in range(i1, i2))
+            if ratio >= 0.5:
+                pairs.append((best, j))
+    return pairs
+
+
+def _tokens(text: str) -> list[str]:
+    return [m.group() for m in TOKEN_RE.finditer(text)]
+
+
+def find_suspicious_tokens(ocr_text: str, code: str) -> list[tuple[tuple[int, int], SuspiciousChange]]:
+    """So từng dòng OCR với dòng LLM theo token. Chỉ xét thay 1-đổi-1 cùng vị trí; tách/gộp token
+    (vd. "21" -> "> 1") là sửa OCR, không xét. Trả về [(span của token LLM trong dòng, thay đổi)]."""
+    ocr_lines, new_lines = ocr_text.split("\n"), code.split("\n")
+    counts = {"ocr_counts": Counter(_tokens(ocr_text)), "llm_counts": Counter(_tokens(code))}
+    found = []
+    for i, j in _pair_lines(ocr_lines, new_lines):
+        old_toks = _tokens(ocr_lines[i])
+        new_matches = list(TOKEN_RE.finditer(new_lines[j]))
+        sm = difflib.SequenceMatcher(None, old_toks, [m.group() for m in new_matches], autojunk=False)
+        for tag, a1, a2, b1, b2 in sm.get_opcodes():
+            if tag != "replace" or a2 - a1 != b2 - b1:
+                continue
+            for a, b in zip(range(a1, a2), range(b1, b2)):
+                new_tok = new_matches[b].group()
+                kind = suspicious_kind(old_toks[a], new_tok, {"ocr_line": ocr_lines[i], "pos": a, **counts})
+                if kind:
+                    found.append((new_matches[b].span(), SuspiciousChange(
+                        line=j + 1, kind=kind, ocr_token=old_toks[a], llm_token=new_tok,
+                        ocr_line=ocr_lines[i], llm_line=new_lines[j])))
+    return found
+
+
+def _line_ratio(a: str, b: str) -> float:
+    na, nb = re.sub(r"\s+", "", a).lower(), re.sub(r"\s+", "", b).lower()
+    return difflib.SequenceMatcher(None, na, nb, autojunk=False).ratio()
+
+
+def find_heavy_lines(ocr_text: str, code: str, min_ratio: float) -> list[SuspiciousChange]:
+    """Dòng nào LLM sửa mà giống dòng OCR dưới `min_ratio` (bỏ khoảng trắng, chữ thường) thì không giống sửa
+    ký tự OCR nữa. Chỉ xét các dòng ghép được với một dòng OCR (xem _pair_lines)."""
+    ocr_lines, new_lines = ocr_text.split("\n"), code.split("\n")
+    return [SuspiciousChange(line=j + 1, kind="line", ocr_token=ocr_lines[i].strip(), llm_token=new_lines[j].strip(),
+                             ocr_line=ocr_lines[i], llm_line=new_lines[j])
+            for i, j in _pair_lines(ocr_lines, new_lines)
+            if _line_ratio(ocr_lines[i], new_lines[j]) < min_ratio]
+
+
+def guard_llm_code(ocr_text: str, code: str, mode: str, min_line_ratio: float) -> tuple[str, list[SuspiciousChange]]:
+    """Phát hiện thay đổi đáng ngờ của LLM (theo token, rồi theo dòng).
+    mode="flag": giữ nguyên code LLM. mode="revert": đặt lại token / nguyên dòng OCR gốc.
+    Trả về (code cuối, danh sách thay đổi đáng ngờ)."""
+    revert = mode == "revert"
+    llm_lines = code.split("\n")
+    tokens = find_suspicious_tokens(ocr_text, code)
+    if revert and tokens:
+        lines = code.split("\n")
+        for (s, e), ch in sorted(tokens, key=lambda t: (t[1].line, t[0][0]), reverse=True):  # phải -> trái
+            ln = lines[ch.line - 1]
+            lines[ch.line - 1] = ln[:s] + ch.ocr_token + ln[e:]
+        code = "\n".join(lines)
+    heavy = find_heavy_lines(ocr_text, code, min_line_ratio)
+    for ch in heavy:   # luôn ghi dòng thô LLM trả về (ở chế độ revert, `code` lúc này đã hoàn tác theo token)
+        ch.llm_line, ch.llm_token = llm_lines[ch.line - 1], llm_lines[ch.line - 1].strip()
+    if revert and heavy:
+        lines = code.split("\n")
+        for ch in heavy:
+            lines[ch.line - 1] = ch.ocr_line
+        code = "\n".join(lines)
+    whole = {ch.line for ch in heavy}   # dòng đã tính cả dòng thì bỏ các mục theo token của dòng đó
+    found = [ch for _, ch in tokens if ch.line not in whole] + heavy
+    for ch in found:
+        ch.reverted = revert
+    return code, found
 
 
 MAX_IMAGE_CHARS = 10_000_000   # ~7.5 MB ảnh gốc sau khi mã hóa base64
@@ -288,6 +442,14 @@ class LLMService:
         if not code.strip():
             raise CustomException(http_code=502, message="LLM trả về code rỗng")
 
+        # ---- Thay đổi đáng ngờ (đổi toán tử / số / tên biến, dòng bị sửa quá nhiều), trước mọi kiểm tra khác.
+        # LLM_GUARD_MODE=flag: chỉ đánh dấu; revert: đặt lại bản OCR gốc
+        llm_lines = code.split("\n")
+        code, suspicious = guard_llm_code(ocr_text.rstrip(), code, settings.LLM_GUARD_MODE,
+                                          settings.LLM_MIN_LINE_SIMILARITY)
+        reverted = [s for s in suspicious if s.reverted]
+        final_lines = code.split("\n")
+
         changes = []
         for c in data.get("changes") or []:
             try:
@@ -300,6 +462,13 @@ class LLMService:
                 ))
             except (TypeError, ValueError, AttributeError):
                 continue
+        if reverted:
+            # Cập nhật "after" của các thay đổi LLM tự liệt kê theo dòng đã hoàn tác; hoàn tác hết thì bỏ
+            reverted_llm = {llm_lines[r.line - 1].strip(): final_lines[r.line - 1] for r in reverted}
+            for c in changes:
+                if c.after.strip() in reverted_llm:
+                    c.after = reverted_llm[c.after.strip()]
+            changes = [c for c in changes if c.after.strip() != c.before.strip()]
         if not changes and code != ocr_text.rstrip():
             changes = line_diff(ocr_text.rstrip(), code)
 
@@ -310,13 +479,36 @@ class LLMService:
                     line=int(u.get("line") or 0), text=str(u.get("text", "")), note=str(u.get("note", ""))))
             except (TypeError, ValueError, AttributeError):
                 continue
+        for s in suspicious:
+            if s.reverted:
+                note = REVERT_LINE_NOTE if s.kind == "line" else REVERT_NOTE
+                uncertain.append(UncertainSpot(
+                    line=s.line, text=s.ocr_token, note=f"{note} (LLM đề xuất '{s.ocr_token}' -> '{s.llm_token}')"))
+            else:
+                note = FLAG_LINE_NOTE if s.kind == "line" else FLAG_NOTE
+                uncertain.append(UncertainSpot(
+                    line=s.line, text=s.llm_token, note=f"{note} (LLM đã đổi '{s.ocr_token}' -> '{s.llm_token}')"))
 
         # ---- Kiểm tra an toàn: LLM có đang "viết lại" code thay vì chỉ sửa lỗi OCR không?
         syntax_ok, syntax_error = check_syntax(code)
         sim = similarity(ocr_text, code)
         reasons = []
-        if sim < settings.LLM_MIN_SIMILARITY:
-            reasons.append(f"Code sau khi sửa chỉ giống bản OCR {sim:.0%} (ngưỡng {settings.LLM_MIN_SIMILARITY:.0%}), "
+        token_sus = [s for s in suspicious if s.kind != "line"]
+        line_sus = [s for s in suspicious if s.kind == "line"]
+        if token_sus:
+            detail = ", ".join(f"dòng {s.line}: '{s.ocr_token}' -> '{s.llm_token}'" for s in token_sus)
+            verb = "hoàn tác" if token_sus[0].reverted else "nghi ngờ"
+            reasons.append(f"Server {verb} {len(token_sus)} thay đổi của LLM ({detail}): "
+                           "có thể là thay đổi logic, không phải lỗi OCR")
+        if line_sus:
+            lines_ = [s.line for s in line_sus]
+            what = "trả lại nguyên dòng OCR" if line_sus[0].reverted else "nghi ngờ"
+            reasons.append(f"Server {what} ở dòng {lines_}: LLM sửa quá nhiều "
+                           f"(giống bản OCR dưới {settings.LLM_MIN_LINE_SIMILARITY:.0%}), không giống sửa lỗi OCR")
+        # Tính trên code LLM trả về (trước khi server hoàn tác) để vẫn báo được việc LLM đã cố viết lại bài
+        sim_llm = similarity(ocr_text, "\n".join(llm_lines))
+        if sim_llm < settings.LLM_MIN_SIMILARITY:
+            reasons.append(f"Code LLM trả về chỉ giống bản OCR {sim_llm:.0%} (ngưỡng {settings.LLM_MIN_SIMILARITY:.0%}), "
                            "LLM có thể đã viết lại code")
         n_ocr = len([ln for ln in ocr_text.split("\n") if ln.strip()])
         n_new = len([ln for ln in code.split("\n") if ln.strip()])
@@ -340,6 +532,8 @@ class LLMService:
             similarity=round(sim, 4),
             needs_review=bool(reasons),
             review_reasons=reasons,
+            suspicious_changes=suspicious,
+            reverted_changes=reverted,
             used_image=bool(image) and self.client.provider != "mock",
             model=self.client.model,
         )
